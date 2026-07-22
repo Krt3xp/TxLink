@@ -1,0 +1,41 @@
+[collector]
+database_path = "data/taxlink-nfse.sqlite3"
+log_path = "logs/taxlink-nfse.log"
+cycle_interval_seconds = 60
+idle_poll_seconds = 3600
+error_backoff_seconds = 300
+max_error_backoff_seconds = 3600
+max_batches_per_cycle = 20
+request_timeout_seconds = 180
+request_attempts = 3
+
+[adn]
+production_base_url = "https://adn.nfse.gov.br/contribuintes"
+restricted_base_url = "https://adn.producaorestrita.nfse.gov.br/contribuintes"
+production_danfse_base_url = "https://adn.nfse.gov.br/danfse"
+restricted_danfse_base_url = "https://adn.producaorestrita.nfse.gov.br/danfse"
+batch_mode = true
+download_danfse_pdf = true
+
+[[units]]
+code = "unidade-1"
+system_unit_id = 1
+tax_id = "00000000000000"
+name = "Unidade de exemplo"
+environment = "restricted"
+initial_nsu = 0
+enabled = false
+
+[units.certificate]
+provider = "windows"
+thumbprint = "SUBSTITUA_PELO_THUMBPRINT"
+store_location = "Auto"
+certificate_tax_id = "00000000000000"
+
+# Alternativa A1 em arquivo. A senha e lida exclusivamente da variavel
+# indicada em password_env; ela nao deve ser gravada neste arquivo.
+# [units.certificate]
+# provider = "pfx"
+# pfx_path = "certificates/unidade-1.pfx"
+# password_env = "TAXLINK_NFSE_PFX_PASSWORD_UNIDADE_1"
+# certificate_tax_id = "00000000000000"
