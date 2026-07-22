@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--unit", required=True, help="Codigo da unidade")
     backfill.add_argument("--from-nsu", type=int, default=1, help="NSU inicial")
     commands.add_parser("run", help="Executa continuamente em segundo plano")
+    commands.add_parser("serve", help="Inicia API REST, scheduler e worker")
+    commands.add_parser("sync", help="Gera e envia o espelho SQLite por SFTP")
     commands.add_parser("status", help="Exibe cursores e totais do coletor")
     commands.add_parser("doctor", help="Valida configuracao, banco e certificados")
     monitor_data = commands.add_parser(
@@ -79,15 +81,9 @@ def run(argv: list[str] | None = None) -> int:
                         "status": repository.status(),
                         "invoices": repository.invoice_summaries(args.limit),
                         "runs": repository.recent_runs(100),
-                        "certificates": [
-                            {
-                                "unit_code": unit.code,
-                                "provider": unit.certificate.provider,
-                                "thumbprint": unit.certificate.thumbprint,
-                                "store_location": unit.certificate.store_location,
-                            }
-                            for unit in config.units
-                        ],
+                        "certificates": repository.certificates(),
+                        "jobs": repository.recent_collection_jobs(20),
+                        "sync_runs": repository.recent_sync_runs(20),
                     },
                     # Mantem caminhos Windows com acentos seguros mesmo quando o
                     # PowerShell hospedeiro usa uma pagina de codigo diferente.
@@ -109,6 +105,30 @@ def run(argv: list[str] | None = None) -> int:
                 except KeyboardInterrupt:
                     print("Coletor interrompido.")
                 return 0
+            if args.command == "serve":
+                try:
+                    import uvicorn
+                except ImportError as exc:
+                    raise RuntimeError("Instale uvicorn para iniciar a API.") from exc
+                from taxlink_nfse.api import create_app
+
+                uvicorn.run(
+                    create_app(config),
+                    host=config.api.host,
+                    port=config.api.port,
+                    workers=1,
+                )
+                return 0
+            if args.command == "sync":
+                from taxlink_nfse.sync import MirrorSyncService
+
+                service = MirrorSyncService(
+                    config.collector.database_path, config.sync, repository
+                )
+                sync_id = service.enqueue("CLI")
+                success = service.execute(sync_id)
+                print(json.dumps(repository.sync_run(sync_id), ensure_ascii=False))
+                return 0 if success else 1
             if args.command == "backfill":
                 unit = next((item for item in config.units if item.code == args.unit), None)
                 if unit is None:
@@ -185,12 +205,13 @@ def _doctor(config: AppConfig, repository: SqliteRepository) -> int:
             print(f"IGNORADA unidade desabilitada: {unit.code}")
             continue
         try:
-            exists = transport.certificate_exists(unit.certificate)
+            certificate = repository.certificate_for_unit(unit.code)
+            exists = transport.certificate_exists(certificate)
         except Exception as exc:
             exists = False
             failures.append(f"{unit.code}: erro ao verificar certificado: {exc}")
         if exists:
-            print(f"OK certificado: {unit.code} ({unit.certificate.provider})")
+            print(f"OK certificado: {unit.code} ({certificate.provider})")
         else:
             failures.append(f"{unit.code}: certificado nao encontrado ou sem chave privada")
 

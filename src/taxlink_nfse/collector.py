@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from taxlink_nfse.adn import AdnClient
 from taxlink_nfse.config import AppConfig, UnitConfig
@@ -15,6 +15,7 @@ class CycleSummary:
     batches_requested: int = 0
     documents_received: int = 0
     documents_stored: int = 0
+    documents_ignored: int = 0
     danfse_pdfs_stored: int = 0
     errors: int = 0
 
@@ -24,6 +25,7 @@ class CycleSummary:
             "batches_requested": self.batches_requested,
             "documents_received": self.documents_received,
             "documents_stored": self.documents_stored,
+            "documents_ignored": self.documents_ignored,
             "danfse_pdfs_stored": self.danfse_pdfs_stored,
             "errors": self.errors,
         }
@@ -44,20 +46,32 @@ class Collector:
     def initialize(self) -> None:
         self.repository.initialize(self.config.units)
 
-    def run_cycle(self, force: bool = False) -> CycleSummary:
+    def run_cycle(
+        self,
+        force: bool = False,
+        job_id: str | None = None,
+        unit_code: str | None = None,
+    ) -> CycleSummary:
         self.initialize()
         summary = CycleSummary()
         for unit in self.config.units:
             if not unit.enabled:
                 continue
+            if unit_code and unit.code != unit_code:
+                continue
             if not force and not self.repository.is_due(unit.code):
                 continue
             summary.units_processed += 1
-            self._collect_unit(unit, summary)
+            runtime_unit = replace(
+                unit, certificate=self.repository.certificate_for_unit(unit.code)
+            )
+            self._collect_unit(runtime_unit, summary, job_id)
         return summary
 
-    def _collect_unit(self, unit: UnitConfig, summary: CycleSummary) -> None:
-        run_id = self.repository.start_run(unit.code)
+    def _collect_unit(
+        self, unit: UnitConfig, summary: CycleSummary, job_id: str | None = None
+    ) -> None:
+        run_id = self.repository.start_run(unit.code, job_id)
         requested_batches = 0
         received_documents = 0
         stored_documents = 0
@@ -92,11 +106,14 @@ class Collector:
                     fetch_result.documents,
                     maximum_nsu + 1,
                     fetch_result.http_status,
+                    run_id,
                 )
                 received_documents += len(fetch_result.documents)
                 stored_documents += batch_stored
                 summary.documents_received += len(fetch_result.documents)
                 summary.documents_stored += batch_stored
+                ignored = len(fetch_result.documents) - batch_stored
+                summary.documents_ignored += ignored
             else:
                 result = "PARTIAL"
 
@@ -123,6 +140,7 @@ class Collector:
                 received_documents,
                 stored_documents,
                 error_message,
+                max(0, received_documents - stored_documents),
             )
 
     def _download_pending_danfse(self, unit: UnitConfig) -> int:

@@ -25,4 +25,3 @@ def configure_logging(log_path: Path, verbose: bool = False) -> None:
     )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
-

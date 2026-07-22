@@ -4,6 +4,47 @@ Servico Python independente para consultar NFS-e e eventos no Ambiente de Dados
 Nacional (ADN), manter um banco SQLite autocontido e publicar alteracoes em uma
 outbox que sera consumida pelo sistema PHP de contratos.
 
+## Arquitetura Ubuntu em desenvolvimento
+
+A versao 0.2 adiciona a base da operacao no Ubuntu Linux:
+
+- API FastAPI autenticada por Bearer token;
+- fila persistente de coletas com `execution_id` UUID;
+- scheduler diario com APScheduler;
+- certificado A1 PFX ou PEM registrado no SQLite;
+- snapshot consistente pela API nativa de backup do SQLite;
+- envio SFTP com Paramiko e renomeacao atomica no Windows OpenSSH;
+- unidade de servico systemd em `packaging/taxlink-collector.service`.
+
+O catalogo de contratos ainda nao faz parte do coletor. `contract_id` e
+`contract_number` permanecem nulos ate a definicao da integracao com o PHP.
+
+Para iniciar a API, scheduler e worker:
+
+```bash
+python3.11 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+export TAXLINK_API_TOKEN='substitua-por-um-token-forte'
+taxlink-nfse --config config.toml init-db
+taxlink-nfse --config config.toml serve
+```
+
+Rotas principais:
+
+```text
+POST /api/v1/coleta/executar
+GET  /api/v1/coleta/status/{execution_id}
+POST /api/v1/sincronizacao/executar
+GET  /api/v1/sincronizacao/status/{sync_id}
+GET  /api/v1/health
+```
+
+O SFTP permanece desabilitado no exemplo ate que host, usuario, `known_hosts`
+e credencial do Windows Server sejam preenchidos. A aplicacao exige suporte a
+`posix-rename` no servidor SFTP e falha de forma segura se a troca atomica nao
+estiver disponivel.
+
 O projeto de referencia em `C:\Users\edrma\TaxLink\python-taxlink` foi usado
 somente para confirmar o fluxo de certificado Windows e os enderecos da API.
 Nenhum arquivo da referencia e modificado ou importado por esta aplicacao.

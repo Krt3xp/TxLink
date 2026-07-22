@@ -31,11 +31,22 @@ class MutualTlsTransport:
             return self._get_with_windows_store(url, certificate, timeout_seconds)
         if certificate.provider == "pfx":
             return self._get_with_pfx(url, certificate, timeout_seconds)
+        if certificate.provider == "pem":
+            return self._get_with_pem(url, certificate, timeout_seconds)
         raise RuntimeError(f"Provedor de certificado desconhecido: {certificate.provider}")
 
     def certificate_exists(self, certificate: CertificateConfig) -> bool:
         if certificate.provider == "pfx":
             return bool(certificate.pfx_path and certificate.pfx_path.is_file())
+        if certificate.provider == "pem":
+            return bool(
+                certificate.pem_cert_path
+                and certificate.pem_cert_path.is_file()
+                and certificate.pem_key_path
+                and certificate.pem_key_path.is_file()
+            )
+        if os.name != "nt":
+            return False
         locations = (
             "@('CurrentUser','LocalMachine')"
             if certificate.store_location == "Auto"
@@ -197,6 +208,9 @@ finally {
             key_path = temp_path / "private-key.pem"
             cert_path.write_bytes(cert_pem)
             key_path.write_bytes(key_pem)
+            if os.name != "nt":
+                cert_path.chmod(0o600)
+                key_path.chmod(0o600)
             response = requests.get(
                 url,
                 cert=(str(cert_path), str(key_path)),
@@ -208,6 +222,31 @@ finally {
                 body=response.content,
                 headers=dict(response.headers),
             )
+
+    def _get_with_pem(
+        self, url: str, certificate: CertificateConfig, timeout_seconds: int
+    ) -> HttpResponse:
+        assert certificate.pem_cert_path is not None
+        assert certificate.pem_key_path is not None
+        if not certificate.pem_cert_path.is_file():
+            raise RuntimeError(f"Certificado PEM nao encontrado: {certificate.pem_cert_path}")
+        if not certificate.pem_key_path.is_file():
+            raise RuntimeError(f"Chave privada PEM nao encontrada: {certificate.pem_key_path}")
+        try:
+            import requests
+        except ImportError as exc:
+            raise RuntimeError("Instale requests para utilizar certificado PEM.") from exc
+        response = requests.get(
+            url,
+            cert=(str(certificate.pem_cert_path), str(certificate.pem_key_path)),
+            timeout=timeout_seconds,
+            verify=True,
+        )
+        return HttpResponse(
+            status_code=response.status_code,
+            body=response.content,
+            headers=dict(response.headers),
+        )
 
 
 def _last_integer(output: str) -> int:

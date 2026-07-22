@@ -58,4 +58,3 @@ class InstanceLock:
         finally:
             self._file.close()
             self._file = None
-

@@ -4,16 +4,17 @@ import json
 import gzip
 import hashlib
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from taxlink_nfse.config import UnitConfig
+from taxlink_nfse.config import CertificateConfig, UnitConfig
 from taxlink_nfse.domain import DecodedDfe
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class RepositoryError(RuntimeError):
@@ -91,6 +92,24 @@ class SqliteRepository:
                 UNIQUE(tax_id, environment)
             );
 
+            CREATE TABLE IF NOT EXISTS digital_certificate (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                unit_id INTEGER NOT NULL UNIQUE,
+                provider TEXT NOT NULL,
+                certificate_path TEXT,
+                private_key_path TEXT,
+                password_env TEXT,
+                thumbprint TEXT,
+                store_location TEXT,
+                certificate_tax_id TEXT,
+                valid_from TEXT,
+                valid_until TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(unit_id) REFERENCES fiscal_unit(id)
+            );
+
             CREATE TABLE IF NOT EXISTS distribution_cursor (
                 unit_id INTEGER PRIMARY KEY,
                 next_nsu INTEGER NOT NULL DEFAULT 0,
@@ -106,8 +125,31 @@ class SqliteRepository:
                 FOREIGN KEY(unit_id) REFERENCES fiscal_unit(id)
             );
 
+            CREATE TABLE IF NOT EXISTS collection_job (
+                id TEXT PRIMARY KEY,
+                trigger_source TEXT NOT NULL,
+                requested_unit_code TEXT,
+                requested_by TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                units_processed INTEGER NOT NULL DEFAULT 0,
+                requested_batches INTEGER NOT NULL DEFAULT 0,
+                received_documents INTEGER NOT NULL DEFAULT 0,
+                stored_documents INTEGER NOT NULL DEFAULT 0,
+                ignored_documents INTEGER NOT NULL DEFAULT 0,
+                danfse_pdfs_stored INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_collection_job_status
+                ON collection_job(status, created_at);
+
             CREATE TABLE IF NOT EXISTS collection_run (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT,
                 unit_id INTEGER NOT NULL,
                 started_at TEXT NOT NULL,
                 finished_at TEXT,
@@ -115,9 +157,27 @@ class SqliteRepository:
                 requested_batches INTEGER NOT NULL DEFAULT 0,
                 received_documents INTEGER NOT NULL DEFAULT 0,
                 stored_documents INTEGER NOT NULL DEFAULT 0,
+                ignored_documents INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT,
+                FOREIGN KEY(job_id) REFERENCES collection_job(id),
                 FOREIGN KEY(unit_id) REFERENCES fiscal_unit(id)
             );
+
+            CREATE TABLE IF NOT EXISTS collection_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER,
+                unit_id INTEGER NOT NULL,
+                nsu INTEGER,
+                access_key TEXT,
+                event_type TEXT NOT NULL,
+                message TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES collection_run(id),
+                FOREIGN KEY(unit_id) REFERENCES fiscal_unit(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_collection_event_run
+                ON collection_event(run_id, id);
 
             CREATE TABLE IF NOT EXISTS dfe_artifact (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,6 +276,25 @@ class SqliteRepository:
                 UNIQUE(aggregate_type, aggregate_id, operation, aggregate_version)
             );
 
+            CREATE TABLE IF NOT EXISTS sync_run (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                trigger_source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                local_path TEXT,
+                remote_path TEXT,
+                size_bytes INTEGER,
+                sha256 TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                next_attempt_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sync_run_status
+                ON sync_run(status, created_at);
+
             """
         )
         self._migrate_schema(connection)
@@ -313,6 +392,10 @@ class SqliteRepository:
         self._add_column(connection, "invoice", "danfse_pdf_received_at", "TEXT")
         self._add_column(connection, "distribution_cursor", "history_target_nsu", "INTEGER")
         self._add_column(connection, "distribution_cursor", "history_backfilled_at", "TEXT")
+        self._add_column(connection, "collection_run", "job_id", "TEXT")
+        self._add_column(
+            connection, "collection_run", "ignored_documents", "INTEGER NOT NULL DEFAULT 0"
+        )
 
         rows = connection.execute(
             "SELECT id, xml_gzip FROM dfe_artifact WHERE xml_content IS NULL"
@@ -342,11 +425,12 @@ class SqliteRepository:
 
     def register_unit(self, unit: UnitConfig) -> int:
         now = iso_utc()
-        certificate_reference = (
-            unit.certificate.thumbprint
-            if unit.certificate.provider == "windows"
-            else str(unit.certificate.pfx_path or "")
-        )
+        if unit.certificate.provider == "windows":
+            certificate_reference = unit.certificate.thumbprint
+        elif unit.certificate.provider == "pfx":
+            certificate_reference = str(unit.certificate.pfx_path or "")
+        else:
+            certificate_reference = str(unit.certificate.pem_cert_path or "")
         with self.transaction(immediate=True) as connection:
             connection.execute(
                 """
@@ -391,7 +475,98 @@ class SqliteRepository:
                 """,
                 (unit_id, unit.initial_nsu, now, now),
             )
+            certificate = unit.certificate
+            certificate_path = (
+                str(certificate.pfx_path or "")
+                if certificate.provider == "pfx"
+                else str(certificate.pem_cert_path or "")
+            )
+            private_key_path = (
+                str(certificate.pem_key_path or "")
+                if certificate.provider == "pem"
+                else ""
+            )
+            connection.execute(
+                """
+                INSERT INTO digital_certificate (
+                    unit_id, provider, certificate_path, private_key_path,
+                    password_env, thumbprint, store_location, certificate_tax_id,
+                    enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(unit_id) DO UPDATE SET
+                    provider = excluded.provider,
+                    certificate_path = excluded.certificate_path,
+                    private_key_path = excluded.private_key_path,
+                    password_env = excluded.password_env,
+                    thumbprint = excluded.thumbprint,
+                    store_location = excluded.store_location,
+                    certificate_tax_id = excluded.certificate_tax_id,
+                    enabled = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    unit_id,
+                    certificate.provider,
+                    certificate_path or None,
+                    private_key_path or None,
+                    certificate.password_env or None,
+                    certificate.thumbprint or None,
+                    certificate.store_location or None,
+                    certificate.certificate_tax_id or None,
+                    now,
+                    now,
+                ),
+            )
             return unit_id
+
+    def certificate_for_unit(self, unit_code: str) -> CertificateConfig:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT c.*
+                FROM digital_certificate c
+                JOIN fiscal_unit u ON u.id = c.unit_id
+                WHERE u.code = ? AND c.enabled = 1
+                """,
+                (unit_code,),
+            ).fetchone()
+        if row is None:
+            raise RepositoryError(f"Certificado ativo nao encontrado para {unit_code}.")
+        provider = str(row["provider"])
+        certificate_path = str(row["certificate_path"] or "")
+        certificate = CertificateConfig(
+            provider=provider,
+            thumbprint=str(row["thumbprint"] or ""),
+            store_location=str(row["store_location"] or "Auto"),
+            pfx_path=Path(certificate_path) if provider == "pfx" and certificate_path else None,
+            pem_cert_path=(
+                Path(certificate_path) if provider == "pem" and certificate_path else None
+            ),
+            pem_key_path=(
+                Path(str(row["private_key_path"]))
+                if provider == "pem" and row["private_key_path"]
+                else None
+            ),
+            password_env=str(row["password_env"] or ""),
+            certificate_tax_id=str(row["certificate_tax_id"] or ""),
+        )
+        certificate.validate()
+        return certificate
+
+    def certificates(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT u.code AS unit_code, c.provider, c.certificate_path,
+                       c.private_key_path, c.password_env, c.thumbprint,
+                       c.store_location, c.certificate_tax_id, c.valid_from,
+                       c.valid_until, c.enabled
+                FROM digital_certificate c
+                JOIN fiscal_unit u ON u.id = c.unit_id
+                ORDER BY u.code
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def unit_id(self, code: str, connection: sqlite3.Connection | None = None) -> int:
         owns_connection = connection is None
@@ -486,15 +661,158 @@ class SqliteRepository:
         next_poll = str(self.cursor(unit_code)["next_poll_at"])
         return datetime.fromisoformat(next_poll) <= (now or utc_now())
 
-    def start_run(self, unit_code: str) -> int:
+    def create_collection_job(
+        self,
+        trigger_source: str,
+        unit_code: str | None = None,
+        requested_by: str = "",
+    ) -> str:
+        job_id = str(uuid.uuid4())
+        now = iso_utc()
+        with self.transaction(immediate=True) as connection:
+            if unit_code:
+                self.unit_id(unit_code, connection)
+            connection.execute(
+                """
+                INSERT INTO collection_job (
+                    id, trigger_source, requested_unit_code, requested_by,
+                    status, created_at
+                ) VALUES (?, ?, ?, ?, 'QUEUED', ?)
+                """,
+                (job_id, trigger_source.upper(), unit_code or None, requested_by or None, now),
+            )
+        return job_id
+
+    def recover_interrupted_work(self) -> None:
+        """Devolve trabalhos interrompidos a fila apos reinicio do servico."""
+        now = iso_utc()
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE collection_run
+                SET result = 'ERROR', finished_at = ?,
+                    error_message = COALESCE(error_message, 'Servico reiniciado durante a coleta.')
+                WHERE result = 'RUNNING'
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE collection_job
+                SET status = 'QUEUED', started_at = NULL, finished_at = NULL,
+                    error_message = 'Execucao retomada apos reinicio do servico.'
+                WHERE status = 'RUNNING'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE sync_run
+                SET status = 'QUEUED', started_at = NULL, finished_at = NULL,
+                    error_message = 'Sincronizacao retomada apos reinicio do servico.'
+                WHERE status = 'RUNNING'
+                """
+            )
+
+    def claim_collection_job(self, job_id: str) -> bool:
+        with self.transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE collection_job
+                SET status = 'RUNNING', started_at = ?, error_message = NULL
+                WHERE id = ? AND status = 'QUEUED'
+                """,
+                (iso_utc(), job_id),
+            )
+            return cursor.rowcount == 1
+
+    def next_queued_collection_job(self) -> str | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id FROM collection_job
+                WHERE status = 'QUEUED'
+                ORDER BY created_at, id
+                LIMIT 1
+                """
+            ).fetchone()
+            return str(row["id"]) if row else None
+
+    def collection_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM collection_job WHERE id = ?", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recent_collection_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM collection_job ORDER BY created_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def collection_runs_for_job(self, job_id: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT r.*, u.code AS unit_code
+                FROM collection_run r
+                JOIN fiscal_unit u ON u.id = r.unit_id
+                WHERE r.job_id = ?
+                ORDER BY r.id
+                """,
+                (job_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def finish_collection_job(self, job_id: str, summary: dict[str, int]) -> None:
+        errors = int(summary.get("errors", 0))
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE collection_job
+                SET status = ?, finished_at = ?, units_processed = ?,
+                    requested_batches = ?, received_documents = ?,
+                    stored_documents = ?, ignored_documents = ?,
+                    danfse_pdfs_stored = ?, error_count = ?
+                WHERE id = ?
+                """,
+                (
+                    "ERROR" if errors else "SUCCESS",
+                    iso_utc(),
+                    int(summary.get("units_processed", 0)),
+                    int(summary.get("batches_requested", 0)),
+                    int(summary.get("documents_received", 0)),
+                    int(summary.get("documents_stored", 0)),
+                    int(summary.get("documents_ignored", 0)),
+                    int(summary.get("danfse_pdfs_stored", 0)),
+                    errors,
+                    job_id,
+                ),
+            )
+
+    def fail_collection_job(self, job_id: str, error_message: str) -> None:
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE collection_job
+                SET status = 'ERROR', finished_at = ?, error_count = error_count + 1,
+                    error_message = ?
+                WHERE id = ?
+                """,
+                (iso_utc(), error_message[:2000], job_id),
+            )
+
+    def start_run(self, unit_code: str, job_id: str | None = None) -> int:
         with self.transaction(immediate=True) as connection:
             unit_id = self.unit_id(unit_code, connection)
             cursor = connection.execute(
                 """
-                INSERT INTO collection_run(unit_id, started_at, result)
-                VALUES (?, ?, 'RUNNING')
+                INSERT INTO collection_run(job_id, unit_id, started_at, result)
+                VALUES (?, ?, ?, 'RUNNING')
                 """,
-                (unit_id, iso_utc()),
+                (job_id, unit_id, iso_utc()),
             )
             return int(cursor.lastrowid)
 
@@ -506,13 +824,15 @@ class SqliteRepository:
         received_documents: int,
         stored_documents: int,
         error_message: str = "",
+        ignored_documents: int | None = None,
     ) -> None:
         with self.transaction(immediate=True) as connection:
             connection.execute(
                 """
                 UPDATE collection_run
                 SET finished_at = ?, result = ?, requested_batches = ?,
-                    received_documents = ?, stored_documents = ?, error_message = ?
+                    received_documents = ?, stored_documents = ?,
+                    ignored_documents = ?, error_message = ?
                 WHERE id = ?
                 """,
                 (
@@ -521,6 +841,11 @@ class SqliteRepository:
                     requested_batches,
                     received_documents,
                     stored_documents,
+                    (
+                        max(0, received_documents - stored_documents)
+                        if ignored_documents is None
+                        else max(0, ignored_documents)
+                    ),
                     error_message[:2000] or None,
                     run_id,
                 ),
@@ -532,6 +857,7 @@ class SqliteRepository:
         documents: Iterable[DecodedDfe],
         next_nsu: int,
         http_status: int,
+        run_id: int | None = None,
     ) -> int:
         document_list = tuple(documents)
         now = iso_utc()
@@ -541,6 +867,21 @@ class SqliteRepository:
             for document in document_list:
                 artifact_id, inserted = self._insert_artifact(connection, unit_id, document, now)
                 if not inserted:
+                    connection.execute(
+                        """
+                        INSERT INTO collection_event (
+                            run_id, unit_id, nsu, access_key, event_type, message, created_at
+                        ) VALUES (?, ?, ?, ?, 'DOCUMENTO_DUPLICADO', ?, ?)
+                        """,
+                        (
+                            run_id,
+                            unit_id,
+                            document.nsu,
+                            document.access_key or None,
+                            "Documento ja existente; nenhuma nova gravacao realizada.",
+                            now,
+                        ),
+                    )
                     continue
                 stored += 1
                 if document.invoice is not None and document.invoice.access_key:
@@ -875,6 +1216,101 @@ class SqliteRepository:
                 ),
             )
             return delay
+
+    def create_sync_run(self, trigger_source: str) -> str:
+        sync_id = str(uuid.uuid4())
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO sync_run(id, status, trigger_source, created_at)
+                VALUES (?, 'QUEUED', ?, ?)
+                """,
+                (sync_id, trigger_source.upper(), iso_utc()),
+            )
+        return sync_id
+
+    def claim_sync_run(self, sync_id: str) -> bool:
+        with self.transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sync_run
+                SET status = 'RUNNING', started_at = ?, attempts = attempts + 1,
+                    error_message = NULL
+                WHERE id = ? AND status = 'QUEUED'
+                """,
+                (iso_utc(), sync_id),
+            )
+            return cursor.rowcount == 1
+
+    def next_queued_sync_run(self) -> str | None:
+        now = iso_utc()
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE sync_run
+                SET status = 'QUEUED', finished_at = NULL
+                WHERE status = 'ERROR' AND next_attempt_at IS NOT NULL
+                  AND next_attempt_at <= ?
+                """,
+                (now,),
+            )
+            row = connection.execute(
+                """
+                SELECT id FROM sync_run
+                WHERE status = 'QUEUED'
+                ORDER BY created_at, id
+                LIMIT 1
+                """
+            ).fetchone()
+            return str(row["id"]) if row else None
+
+    def finish_sync_run(
+        self,
+        sync_id: str,
+        local_path: str,
+        remote_path: str,
+        size_bytes: int,
+        sha256: str,
+    ) -> None:
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE sync_run
+                SET status = 'SUCCESS', finished_at = ?, local_path = ?, remote_path = ?,
+                    size_bytes = ?, sha256 = ?, next_attempt_at = NULL
+                WHERE id = ?
+                """,
+                (iso_utc(), local_path, remote_path, size_bytes, sha256, sync_id),
+            )
+
+    def fail_sync_run(
+        self, sync_id: str, error_message: str, retry_delay_seconds: int = 300
+    ) -> None:
+        next_attempt = iso_utc(utc_now() + timedelta(seconds=retry_delay_seconds))
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE sync_run
+                SET status = 'ERROR', finished_at = ?, error_message = ?, next_attempt_at = ?
+                WHERE id = ?
+                """,
+                (iso_utc(), error_message[:2000], next_attempt, sync_id),
+            )
+
+    def sync_run(self, sync_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_run WHERE id = ?", (sync_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recent_sync_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_run ORDER BY created_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def status(self) -> list[dict[str, Any]]:
         with self.connection() as connection:

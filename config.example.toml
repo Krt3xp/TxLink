@@ -9,6 +9,34 @@ max_batches_per_cycle = 20
 request_timeout_seconds = 180
 request_attempts = 3
 
+[api]
+host = "0.0.0.0"
+port = 8080
+bearer_token_env = "TAXLINK_API_TOKEN"
+
+[scheduler]
+enabled = true
+daily_times = ["02:00"]
+job_poll_seconds = 5
+timezone = "America/Sao_Paulo"
+
+[sync]
+enabled = false
+local_mirror_path = "data/taxlink_mirror.db"
+host = "192.168.1.20"
+port = 22
+username = "taxlink_sftp"
+password_env = "TAXLINK_SFTP_PASSWORD"
+# Alternativa recomendada: chave SSH em vez de senha.
+# private_key_path = "/etc/taxlink/ssh/id_ed25519"
+# private_key_password_env = "TAXLINK_SFTP_KEY_PASSWORD"
+known_hosts_path = "/etc/taxlink/ssh/known_hosts"
+# No OpenSSH para Windows, confirme o caminho exposto pelo SFTP.
+remote_directory = "/C:/TaxLink/data"
+temporary_filename = "taxlink_temp.db"
+final_filename = "taxlink_mirror.db"
+timeout_seconds = 60
+
 [adn]
 production_base_url = "https://adn.nfse.gov.br/contribuintes"
 restricted_base_url = "https://adn.producaorestrita.nfse.gov.br/contribuintes"
@@ -38,4 +66,11 @@ certificate_tax_id = "00000000000000"
 # provider = "pfx"
 # pfx_path = "certificates/unidade-1.pfx"
 # password_env = "TAXLINK_NFSE_PFX_PASSWORD_UNIDADE_1"
+# certificate_tax_id = "00000000000000"
+
+# Exemplo PEM no Ubuntu:
+# [units.certificate]
+# provider = "pem"
+# pem_cert_path = "/etc/taxlink/certificates/unidade-1/certificate.pem"
+# pem_key_path = "/etc/taxlink/certificates/unidade-1/private-key.pem"
 # certificate_tax_id = "00000000000000"
