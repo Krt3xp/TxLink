@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from taxlink_nfse.config import CertificateConfig, UnitConfig
+from taxlink_nfse.certificates import inspect_certificate
 from taxlink_nfse.domain import DecodedDfe
 
 
@@ -302,6 +303,7 @@ class SqliteRepository:
             """
             DROP VIEW IF EXISTS vw_invoice_outbox;
             DROP VIEW IF EXISTS vw_notas_fiscais;
+            DROP VIEW IF EXISTS vw_certificados_digitais;
 
             CREATE VIEW vw_invoice_outbox AS
             SELECT
@@ -364,6 +366,29 @@ class SqliteRepository:
             FROM invoice i
             JOIN fiscal_unit u ON u.id = i.unit_id
             JOIN dfe_artifact a ON a.id = i.source_artifact_id;
+
+            CREATE VIEW vw_certificados_digitais AS
+            SELECT
+                c.id AS "ID",
+                u.code AS "Unidade",
+                u.name AS "Nome da Unidade",
+                u.tax_id AS "CNPJ da Unidade",
+                upper(c.provider) AS "Formato",
+                c.certificate_path AS "Arquivo no Servidor",
+                c.private_key_path AS "Chave PEM no Servidor",
+                c.password_env AS "Variavel da Senha",
+                c.thumbprint AS "Thumbprint",
+                c.certificate_tax_id AS "CNPJ do Certificado",
+                c.valid_from AS "Valido Desde",
+                c.valid_until AS "Valido Ate",
+                CASE
+                    WHEN c.enabled = 0 THEN 'INATIVO'
+                    WHEN c.valid_until IS NULL THEN 'VALIDADE NAO EXTRAIDA'
+                    WHEN datetime(c.valid_until) < datetime('now') THEN 'VENCIDO'
+                    ELSE 'VALIDO'
+                END AS "Situacao"
+            FROM digital_certificate c
+            JOIN fiscal_unit u ON u.id = c.unit_id;
             """
         )
         connection.execute(
@@ -425,6 +450,7 @@ class SqliteRepository:
 
     def register_unit(self, unit: UnitConfig) -> int:
         now = iso_utc()
+        certificate_metadata = inspect_certificate(unit.certificate)
         if unit.certificate.provider == "windows":
             certificate_reference = unit.certificate.thumbprint
         elif unit.certificate.provider == "pfx":
@@ -491,16 +517,18 @@ class SqliteRepository:
                 INSERT INTO digital_certificate (
                     unit_id, provider, certificate_path, private_key_path,
                     password_env, thumbprint, store_location, certificate_tax_id,
-                    enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    valid_from, valid_until, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT(unit_id) DO UPDATE SET
                     provider = excluded.provider,
                     certificate_path = excluded.certificate_path,
                     private_key_path = excluded.private_key_path,
                     password_env = excluded.password_env,
-                    thumbprint = excluded.thumbprint,
+                    thumbprint = COALESCE(excluded.thumbprint, digital_certificate.thumbprint),
                     store_location = excluded.store_location,
                     certificate_tax_id = excluded.certificate_tax_id,
+                    valid_from = COALESCE(excluded.valid_from, digital_certificate.valid_from),
+                    valid_until = COALESCE(excluded.valid_until, digital_certificate.valid_until),
                     enabled = 1,
                     updated_at = excluded.updated_at
                 """,
@@ -510,9 +538,27 @@ class SqliteRepository:
                     certificate_path or None,
                     private_key_path or None,
                     certificate.password_env or None,
-                    certificate.thumbprint or None,
-                    certificate.store_location or None,
+                    (
+                        certificate_metadata.thumbprint
+                        if certificate_metadata is not None
+                        else certificate.thumbprint or None
+                    ),
+                    (
+                        certificate.store_location
+                        if certificate.provider == "windows"
+                        else None
+                    ),
                     certificate.certificate_tax_id or None,
+                    (
+                        certificate_metadata.valid_from
+                        if certificate_metadata is not None
+                        else None
+                    ),
+                    (
+                        certificate_metadata.valid_until
+                        if certificate_metadata is not None
+                        else None
+                    ),
                     now,
                     now,
                 ),
@@ -1327,7 +1373,9 @@ class SqliteRepository:
                         AND i.danfse_pdf IS NOT NULL) AS danfse_pdfs,
                     (SELECT COUNT(*) FROM invoice i WHERE i.unit_id = u.id
                         AND i.contract_id IS NOT NULL) AS linked_contracts,
-                    (SELECT COUNT(*) FROM integration_outbox o) AS outbox_entries
+                    (SELECT COUNT(*) FROM integration_outbox o
+                        JOIN invoice oi ON o.aggregate_type = 'INVOICE'
+                            AND oi.id = o.aggregate_id AND oi.unit_id = u.id) AS outbox_entries
                 FROM fiscal_unit u
                 JOIN distribution_cursor c ON c.unit_id = u.id
                 ORDER BY u.code
