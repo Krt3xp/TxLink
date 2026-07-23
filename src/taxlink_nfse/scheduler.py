@@ -70,9 +70,23 @@ class TaxLinkScheduler:
         job_id = self.repository.next_queued_collection_job()
         if job_id is not None:
             self.execute_collection_and_sync(job_id)
-            return
-        if self.config.sync.enabled:
+        elif self.config.sync.enabled:
             self.sync.execute_next()
+        self._purge_outbox()
+
+    def _purge_outbox(self) -> None:
+        try:
+            deleted = self.repository.purge_outbox(
+                self.config.collector.outbox_retention_days
+            )
+            if deleted:
+                self.logger.info(
+                    "Outbox: %d registro(s) com mais de %d dia(s) removido(s)",
+                    deleted,
+                    self.config.collector.outbox_retention_days,
+                )
+        except Exception:
+            self.logger.exception("Falha ao limpar o integration_outbox")
 
     def execute_collection_and_sync(self, job_id: str) -> None:
         executed = self.jobs.execute(job_id)

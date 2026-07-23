@@ -140,6 +140,7 @@ class CollectorConfig:
     max_batches_per_cycle: int
     request_timeout_seconds: int
     request_attempts: int
+    outbox_retention_days: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +255,7 @@ class AppConfig:
                 collector_raw, "request_timeout_seconds", 180
             ),
             request_attempts=_positive_int(collector_raw, "request_attempts", 3),
+            outbox_retention_days=max(1, int(collector_raw.get("outbox_retention_days", 30))),
         )
         if collector.max_error_backoff_seconds < collector.error_backoff_seconds:
             raise ValueError("max_error_backoff_seconds nao pode ser menor que error_backoff_seconds.")

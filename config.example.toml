@@ -8,6 +8,7 @@ max_error_backoff_seconds = 3600
 max_batches_per_cycle = 20
 request_timeout_seconds = 180
 request_attempts = 3
+outbox_retention_days = 30
 
 [api]
 host = "0.0.0.0"

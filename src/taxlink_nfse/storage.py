@@ -1421,5 +1421,16 @@ class SqliteRepository:
             ).fetchall()
             return [dict(row) for row in rows]
 
+
+    def purge_outbox(self, retention_days: int) -> int:
+        """Remove registros do integration_outbox mais antigos que retention_days."""
+        cutoff = iso_utc(utc_now() - timedelta(days=retention_days))
+        with self.transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                "DELETE FROM integration_outbox WHERE created_at < ?",
+                (cutoff,),
+            )
+            return cursor.rowcount
+
     def dump_status_json(self) -> str:
         return json.dumps(self.status(), ensure_ascii=False, indent=2)
