@@ -128,10 +128,6 @@ erDiagram
         TEXT fiscal_status
         INTEGER contract_id "referencia logica PHP"
         TEXT contract_number
-        BLOB danfse_pdf
-        TEXT danfse_pdf_sha256
-        TEXT danfse_pdf_status
-        TEXT danfse_pdf_received_at
         INTEGER version
         TEXT created_at
         TEXT updated_at
@@ -212,9 +208,9 @@ erDiagram
 | `collection_run` | Auditoria de cada ciclo, com lotes solicitados, documentos recebidos/salvos e eventual erro. |
 | `collection_event` | Log estruturado de duplicidades e demais ocorrencias da coleta. |
 | `dfe_artifact` | Evidencia fiscal original. Preserva XML comprimido, XML consultavel e SHA-256. |
-| `invoice` | Cabecalho normalizado da NFS-e, DANFSe oficial e futura referencia ao contrato PHP. |
+| `invoice` | Cabecalho normalizado da NFS-e e futura referencia ao contrato PHP. |
 | `invoice_item` | Itens/servicos extraidos do XML. |
-| `fiscal_event` | Eventos fiscais associados pela chave da NFS-e. |
+| `fiscal_event` | Eventos fiscais associados pela chave da NFS-e, incluindo o codigo nacional do evento (`event_code`). |
 | `integration_outbox` | Fila imutavel de alteracoes para consumo idempotente pelo PHP. |
 | `sync_run` | Auditoria da copia consistente e transferencia atomica do espelho por SFTP. |
 
@@ -272,14 +268,12 @@ Visao operacional solicitada para consulta humana e integracao simples:
 | `Valor` | `invoice.service_amount_cents / 100` |
 | `Competencia` | `invoice.competence_date` |
 | `XML` | `dfe_artifact.xml_content` |
-| `DANFe PDF` | `invoice.danfse_pdf` |
-| `Status DANFe PDF` | `invoice.danfse_pdf_status` |
 | `Chave de Acesso` | `invoice.access_key` |
 | `NSU` | `dfe_artifact.nsu` |
 
 ### `vw_invoice_outbox`
 
-Contrato de leitura para o sistema PHP. Combina outbox, unidade, nota e artefato sem expor os BLOBs XML/PDF na listagem principal.
+Contrato de leitura para o sistema PHP. Combina outbox, unidade, nota e artefato sem expor o BLOB do XML na listagem principal.
 
 ## 6. MER logico de integracao com o sistema PHP
 
@@ -341,7 +335,6 @@ erDiagram
         DATE dt_competencia
         DECIMAL valor
         TEXT arquivo_xml
-        TEXT arquivo_pdf
     }
 
     INVOICE_SQLITE {
@@ -385,7 +378,6 @@ Se houver zero ou mais de um contrato elegivel, a NFS-e permanece sem vinculo au
 flowchart LR
     ADN["ADN NFS-e"] -->|"DFe por NSU"| ART["dfe_artifact"]
     ART -->|"parse XML"| INV["invoice / invoice_item"]
-    ADN -->|"DANFSe por chave"| INV
     INV --> OUT["integration_outbox"]
     OUT --> PHP["Sistema PHP de contratos"]
     PHP -->|"contrato unico"| LINK["contract_id / contract_number"]

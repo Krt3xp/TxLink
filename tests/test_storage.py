@@ -64,6 +64,17 @@ def sample_document(nsu: int = 0):
     )
 
 
+def sample_event(xml_bytes: bytes, nsu: int):
+    return DfeDecoder().decode(
+        {
+            "NSU": nsu,
+            "ChaveAcesso": "330455705029600000368000000000000000000000001",
+            "TipoDocumento": "EVENTO",
+            "ArquivoXml": base64.b64encode(gzip.compress(xml_bytes)).decode("ascii"),
+        }
+    )
+
+
 class StorageTests(unittest.TestCase):
     def test_batch_is_idempotent_and_advances_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -101,16 +112,72 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(consolidated[2], "28524508000108")
                 self.assertEqual(consolidated[3], NFSE_XML)
 
-            pending = repository.pending_danfse("u1")
-            self.assertEqual(len(pending), 1)
-            repository.save_danfse(1, "BAIXADO_OFICIAL", b"%PDF-test")
             repository.link_contract(1, 99, "CTS-99")
             with closing(sqlite3.connect(config.collector.database_path)) as connection:
                 row = connection.execute(
-                    'SELECT "Contrato", "Contrato ID", "DANFe PDF" '
+                    'SELECT "Contrato", "Contrato ID", "XML" '
                     'FROM vw_notas_fiscais'
                 ).fetchone()
-                self.assertEqual(row, ("CTS-99", 99, b"%PDF-test"))
+                self.assertEqual(row, ("CTS-99", 99, NFSE_XML))
+
+    def test_initialize_removes_legacy_pdf_columns_without_losing_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = write_test_config(root)
+            repository = SqliteRepository(config.collector.database_path)
+            repository.initialize(config.units)
+            repository.persist_batch("u1", [sample_document(10)], 11, 200)
+            job_id = repository.create_collection_job("TEST", "u1")
+
+            with closing(sqlite3.connect(config.collector.database_path)) as connection:
+                connection.execute("ALTER TABLE invoice ADD COLUMN danfse_pdf BLOB")
+                connection.execute(
+                    "ALTER TABLE invoice ADD COLUMN danfse_pdf_sha256 TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE invoice ADD COLUMN danfse_pdf_status TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE invoice ADD COLUMN danfse_pdf_received_at TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE collection_job ADD COLUMN danfse_pdfs_stored INTEGER"
+                )
+                connection.execute(
+                    "UPDATE invoice SET danfse_pdf = ?, danfse_pdf_status = ?",
+                    (b"%PDF-legacy", "BAIXADO_OFICIAL"),
+                )
+                connection.execute(
+                    "UPDATE collection_job SET danfse_pdfs_stored = 1 WHERE id = ?",
+                    (job_id,),
+                )
+                connection.commit()
+
+            repository.initialize(config.units)
+
+            with closing(sqlite3.connect(config.collector.database_path)) as connection:
+                invoice_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(invoice)")
+                }
+                job_columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(collection_job)")
+                }
+                invoice = connection.execute(
+                    "SELECT id, access_key, contract_id FROM invoice"
+                ).fetchone()
+                job = connection.execute(
+                    "SELECT id, status FROM collection_job WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+
+            self.assertFalse(any("pdf" in column.lower() for column in invoice_columns))
+            self.assertNotIn("danfse_pdfs_stored", job_columns)
+            self.assertEqual(
+                invoice,
+                (1, "330455705029600000368000000000000000000000001", None),
+            )
+            self.assertEqual(job, (job_id, "QUEUED"))
 
     def test_same_nsu_with_different_xml_does_not_advance_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -126,6 +193,102 @@ class StorageTests(unittest.TestCase):
                 repository.persist_batch("u1", [changed], 99, 200)
 
             self.assertEqual(repository.cursor("u1")["next_nsu"], 6)
+
+    def test_national_cancellation_event_updates_invoice_and_outbox(self) -> None:
+        cancellation_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<evento xmlns="http://www.sped.fazenda.gov.br/nfse">
+  <infEvento>
+    <nSeqEvento>1</nSeqEvento>
+    <pedRegEvento>
+      <infPedReg>
+        <dhEvento>2026-07-28T09:59:24-03:00</dhEvento>
+        <chNFSe>330455705029600000368000000000000000000000001</chNFSe>
+        <e101101>
+          <xDesc>Cancelamento de NFS-e</xDesc>
+          <xMotivo>Erro na emissao</xMotivo>
+        </e101101>
+      </infPedReg>
+    </pedRegEvento>
+  </infEvento>
+</evento>
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = write_test_config(root)
+            repository = SqliteRepository(config.collector.database_path)
+            repository.initialize(config.units)
+            repository.persist_batch("u1", [sample_document(10)], 11, 200)
+            repository.persist_batch(
+                "u1",
+                [sample_event(cancellation_xml, 11)],
+                12,
+                200,
+            )
+
+            with closing(sqlite3.connect(config.collector.database_path)) as connection:
+                status = connection.execute("SELECT fiscal_status FROM invoice").fetchone()[0]
+                outbox_count = connection.execute(
+                    "SELECT COUNT(*) FROM integration_outbox"
+                ).fetchone()[0]
+                event_type = connection.execute(
+                    "SELECT event_type FROM fiscal_event"
+                ).fetchone()[0]
+                event_code = connection.execute(
+                    "SELECT event_code FROM fiscal_event"
+                ).fetchone()[0]
+                outbox_event_code = connection.execute(
+                    "SELECT event_code FROM vw_invoice_outbox ORDER BY outbox_id DESC LIMIT 1"
+                ).fetchone()[0]
+
+            self.assertEqual(status, "CANCELADA")
+            self.assertEqual(event_type, "CANCELAMENTO")
+            self.assertEqual(event_code, "101101")
+            self.assertEqual(outbox_event_code, "101101")
+            self.assertEqual(outbox_count, 2)
+
+    def test_initialize_reconciles_previously_generic_fiscal_event(self) -> None:
+        cancellation_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<evento xmlns="http://www.sped.fazenda.gov.br/nfse">
+  <infEvento>
+    <nSeqEvento>1</nSeqEvento>
+    <pedRegEvento>
+      <infPedReg>
+        <dhEvento>2026-07-28T09:59:24-03:00</dhEvento>
+        <chNFSe>330455705029600000368000000000000000000000001</chNFSe>
+        <e101101><xDesc>Cancelamento de NFS-e</xDesc></e101101>
+      </infPedReg>
+    </pedRegEvento>
+  </infEvento>
+</evento>
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = write_test_config(root)
+            repository = SqliteRepository(config.collector.database_path)
+            repository.initialize(config.units)
+            repository.persist_batch("u1", [sample_document(10)], 11, 200)
+
+            parsed_event = sample_event(cancellation_xml, 11)
+            assert parsed_event.fiscal_event is not None
+            generic_event = replace(
+                parsed_event,
+                fiscal_event=replace(parsed_event.fiscal_event, event_type="EVENTO"),
+            )
+            repository.persist_batch("u1", [generic_event], 12, 200)
+
+            repository.initialize(config.units)
+
+            with closing(sqlite3.connect(config.collector.database_path)) as connection:
+                status = connection.execute("SELECT fiscal_status FROM invoice").fetchone()[0]
+                event_type = connection.execute(
+                    "SELECT event_type FROM fiscal_event"
+                ).fetchone()[0]
+                event_code = connection.execute(
+                    "SELECT event_code FROM fiscal_event"
+                ).fetchone()[0]
+            self.assertEqual(status, "CANCELADA")
+            self.assertEqual(event_type, "CANCELAMENTO")
+            self.assertEqual(event_code, "101101")
 
     def test_rewind_cursor_prepares_historical_collection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

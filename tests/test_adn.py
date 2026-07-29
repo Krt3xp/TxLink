@@ -48,21 +48,5 @@ class AdnClientTests(unittest.TestCase):
             self.assertIn("cnpjConsulta=05029600000368", transport.urls[0])
             self.assertIn("lote=true", transport.urls[0])
 
-    def test_fetches_official_danfse_pdf(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config = write_test_config(Path(temp_dir))
-            transport = FakeTransport(HttpResponse(200, b"%PDF-test", {}))
-            client = AdnClient(config.adn, config.collector, transport=transport)
-
-            result = client.fetch_danfse(config.units[0], "KEY7")
-
-            self.assertEqual(result.status, "BAIXADO_OFICIAL")
-            self.assertEqual(result.pdf_bytes, b"%PDF-test")
-            self.assertEqual(
-                transport.urls[0],
-                "https://adn.producaorestrita.nfse.gov.br/danfse/KEY7",
-            )
-
-
 if __name__ == "__main__":
     unittest.main()

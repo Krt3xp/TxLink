@@ -174,7 +174,7 @@ As tabelas centrais sao:
 - `collection_run`;
 - `dfe_artifact`;
 - `invoice` e `invoice_item`;
-- `fiscal_event`;
+- `fiscal_event`, incluindo o codigo nacional do evento;
 - `integration_outbox`.
 
 O PHP devera ler a outbox em ordem crescente, guardar seu ultimo ID consumido
@@ -191,15 +191,13 @@ A view `vw_notas_fiscais` apresenta a consulta operacional consolidada com:
 - ID interno da NFS-e;
 - CNPJ da unidade e do fornecedor;
 - emissao, valor e competencia;
-- XML nacional sem compactacao e DANFSe em PDF, ambos como BLOB;
-- chave de acesso, NSU e origem/estado do DANFSe: `BAIXADO_OFICIAL` quando
-  retornado pelo ADN ou `GERADO_DO_XML` quando o PDF oficial estiver
-  indisponivel.
+- XML nacional sem compactacao como BLOB;
+- chave de acesso e NSU.
 
 Exemplo sem imprimir os arquivos binarios no terminal:
 
 ```powershell
-sqlite3 -readonly -header -column data\taxlink-nfse.sqlite3 "SELECT [ID], [Contrato], [Contrato ID], [Unidade CNPJ], [Fornecedor CNPJ], [Data de Emissao], printf('%.2f', [Valor]) AS [Valor], [Competencia], length([XML]) AS [XML bytes], length([DANFe PDF]) AS [PDF bytes], [Status DANFe PDF], [NSU] FROM vw_notas_fiscais ORDER BY [NSU];"
+sqlite3 -readonly -header -column data\taxlink-nfse.sqlite3 "SELECT [ID], [Contrato], [Contrato ID], [Unidade CNPJ], [Fornecedor CNPJ], [Data de Emissao], printf('%.2f', [Valor]) AS [Valor], [Competencia], length([XML]) AS [XML bytes], [NSU] FROM vw_notas_fiscais ORDER BY [NSU];"
 ```
 
 O ADN nao possui o contrato administrativo. Por isso `Contrato` e `Contrato ID`

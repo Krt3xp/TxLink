@@ -116,7 +116,6 @@ certificate_tax_id = "05029600000104"
                     "documents_received": 2,
                     "documents_stored": 1,
                     "documents_ignored": 1,
-                    "danfse_pdfs_stored": 0,
                     "errors": 0,
                 },
             )

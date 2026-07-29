@@ -15,7 +15,6 @@ dependencies = [
     "uvicorn>=0.30.0",
     "apscheduler>=3.10.4,<4",
     "paramiko>=3.4.0",
-    "reportlab>=4.2.0",
 ]
 
 [project.scripts]
@@ -26,6 +25,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-taxlink_nfse = ["assets/*.png"]

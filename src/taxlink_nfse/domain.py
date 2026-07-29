@@ -36,6 +36,7 @@ class ParsedFiscalEvent:
     """Evento fiscal extraido de CancNfse, SubNfse ou evtConfRecebNfse."""
     invoice_access_key: str
     event_type: str
+    event_code: str = ""
     event_sequence: int = 0
     occurred_at: str = ""
     protocol: str = ""
@@ -62,10 +63,3 @@ class FetchResult:
     requested_nsu: int
     http_status: int
     documents: tuple[DecodedDfe, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class DanfseResult:
-    status: str
-    http_status: int
-    pdf_bytes: bytes | None = None

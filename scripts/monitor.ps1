@@ -301,7 +301,7 @@ function Get-FilteredInvoices {
 function Update-InvoiceGrid {
     $invoices = Get-FilteredInvoices
     $table = New-Object System.Data.DataTable
-    foreach ($column in @("ID", "NSU", "Emissao", "Fornecedor", "CNPJ", "Valor", "Competencia", "XML", "DANFSe", "Contrato")) {
+    foreach ($column in @("ID", "NSU", "Emissao", "Fornecedor", "CNPJ", "Valor", "Competencia", "XML", "Contrato")) {
         [void]$table.Columns.Add($column)
     }
     foreach ($invoice in $invoices) {
@@ -314,7 +314,6 @@ function Update-InvoiceGrid {
         $row["Valor"] = if ($null -ne $invoice.service_amount_cents) { "R$ {0:N2}" -f ([decimal]$invoice.service_amount_cents / 100) } else { "" }
         $row["Competencia"] = $invoice.competence_date
         $row["XML"] = if ([int]$invoice.xml_bytes -gt 0) { "OK" } else { "Pendente" }
-        $row["DANFSe"] = if ([int]$invoice.pdf_bytes -gt 0) { "OK" } else { [string]$invoice.danfse_pdf_status }
         $row["Contrato"] = if ($invoice.contract_number) { $invoice.contract_number } else { "Nao vinculado" }
         [void]$table.Rows.Add($row)
     }
@@ -329,14 +328,11 @@ function Update-InvoiceGrid {
         $script:InvoiceGrid.Columns[6].Width = 90
         $script:InvoiceGrid.Columns[7].Width = 55
         $script:InvoiceGrid.Columns[8].Width = 115
-        $script:InvoiceGrid.Columns[9].Width = 115
     }
 
     $script:MetricLabels["invoices"].Text = [string]$invoices.Count
     $script:MetricLabels["xml"].Text = [string]@($invoices | Where-Object { [int]$_.xml_bytes -gt 0 }).Count
-    $script:MetricLabels["pdf"].Text = [string]@($invoices | Where-Object { [int]$_.pdf_bytes -gt 0 }).Count
     $script:MetricLabels["contracts"].Text = [string]@($invoices | Where-Object { $null -ne $_.contract_id }).Count
-    $script:MetricLabels["pending"].Text = [string]@($invoices | Where-Object { [int]$_.pdf_bytes -le 0 }).Count
 }
 
 function Update-UnitDetails {
@@ -763,7 +759,7 @@ function Show-DatabaseWindow {
     $databaseGrid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(247, 249, 252)
 
     $table = New-Object System.Data.DataTable
-    foreach ($column in @("ID", "NSU", "Chave de acesso", "Unidade CNPJ", "Fornecedor CNPJ", "Fornecedor", "Emissao", "Valor", "Competencia", "XML bytes", "PDF bytes", "Status PDF", "Contrato ID", "Contrato")) {
+    foreach ($column in @("ID", "NSU", "Chave de acesso", "Unidade CNPJ", "Fornecedor CNPJ", "Fornecedor", "Emissao", "Valor", "Competencia", "XML bytes", "Contrato ID", "Contrato")) {
         [void]$table.Columns.Add($column)
     }
     foreach ($invoice in $script:MonitorData.invoices) {
@@ -778,8 +774,6 @@ function Show-DatabaseWindow {
         $row["Valor"] = if ($null -ne $invoice.service_amount_cents) { "R$ {0:N2}" -f ([decimal]$invoice.service_amount_cents / 100) } else { "" }
         $row["Competencia"] = $invoice.competence_date
         $row["XML bytes"] = $invoice.xml_bytes
-        $row["PDF bytes"] = $invoice.pdf_bytes
-        $row["Status PDF"] = $invoice.danfse_pdf_status
         $row["Contrato ID"] = $invoice.contract_id
         $row["Contrato"] = $invoice.contract_number
         [void]$table.Rows.Add($row)
@@ -928,17 +922,15 @@ $main.Controls.Add($queryGroup, 0, 1)
 $script:MetricLabels = @{}
 $metrics = New-Object System.Windows.Forms.TableLayoutPanel
 $metrics.Dock = "Fill"
-$metrics.ColumnCount = 6
+$metrics.ColumnCount = 4
 $metrics.RowCount = 1
-for ($index = 0; $index -lt 6; $index++) {
-    $metrics.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle("Percent", 16.6667)))
+for ($index = 0; $index -lt 4; $index++) {
+    $metrics.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle("Percent", 25)))
 }
 $metrics.Controls.Add((New-MetricCard "Notas fiscais" "invoices" ([System.Drawing.Color]::FromArgb(40, 110, 190))), 0, 0)
 $metrics.Controls.Add((New-MetricCard "XML armazenados" "xml" ([System.Drawing.Color]::FromArgb(32, 150, 105))), 1, 0)
-$metrics.Controls.Add((New-MetricCard "DANFSe PDF" "pdf" ([System.Drawing.Color]::FromArgb(118, 82, 180))), 2, 0)
-$metrics.Controls.Add((New-MetricCard "Contratos vinculados" "contracts" ([System.Drawing.Color]::FromArgb(225, 145, 45))), 3, 0)
-$metrics.Controls.Add((New-MetricCard "PDF pendentes" "pending" ([System.Drawing.Color]::FromArgb(110, 120, 135))), 4, 0)
-$metrics.Controls.Add((New-MetricCard "Erros consecutivos" "errors" ([System.Drawing.Color]::FromArgb(195, 60, 60))), 5, 0)
+$metrics.Controls.Add((New-MetricCard "Contratos vinculados" "contracts" ([System.Drawing.Color]::FromArgb(225, 145, 45))), 2, 0)
+$metrics.Controls.Add((New-MetricCard "Erros consecutivos" "errors" ([System.Drawing.Color]::FromArgb(195, 60, 60))), 3, 0)
 $main.Controls.Add($metrics, 0, 2)
 
 $script:InvoiceGrid = New-Object System.Windows.Forms.DataGridView

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import gzip
-import hashlib
 import sqlite3
 import uuid
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +15,7 @@ from taxlink_nfse.certificates import inspect_certificate
 from taxlink_nfse.domain import DecodedDfe
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 
 class RepositoryError(RuntimeError):
@@ -140,7 +140,6 @@ class SqliteRepository:
                 received_documents INTEGER NOT NULL DEFAULT 0,
                 stored_documents INTEGER NOT NULL DEFAULT 0,
                 ignored_documents INTEGER NOT NULL DEFAULT 0,
-                danfse_pdfs_stored INTEGER NOT NULL DEFAULT 0,
                 error_count INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT
             );
@@ -219,10 +218,6 @@ class SqliteRepository:
                 fiscal_status TEXT NOT NULL,
                 contract_id INTEGER,
                 contract_number TEXT,
-                danfse_pdf BLOB,
-                danfse_pdf_sha256 TEXT,
-                danfse_pdf_status TEXT NOT NULL DEFAULT 'PENDENTE',
-                danfse_pdf_received_at TEXT,
                 version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -256,6 +251,7 @@ class SqliteRepository:
                 source_artifact_id INTEGER NOT NULL,
                 invoice_access_key TEXT,
                 event_key TEXT,
+                event_code TEXT,
                 event_type TEXT,
                 event_sequence INTEGER,
                 occurred_at TEXT,
@@ -329,11 +325,18 @@ class SqliteRepository:
                 i.service_amount_cents,
                 i.net_amount_cents,
                 i.fiscal_status,
+                (
+                    SELECT fe.event_code
+                    FROM fiscal_event fe
+                    WHERE fe.unit_id = i.unit_id
+                      AND fe.invoice_access_key = i.access_key
+                      AND fe.event_code IS NOT NULL
+                      AND fe.event_code <> ''
+                    ORDER BY COALESCE(fe.occurred_at, fe.created_at) DESC, fe.id DESC
+                    LIMIT 1
+                ) AS event_code,
                 i.contract_id,
                 i.contract_number,
-                i.danfse_pdf_status,
-                i.danfse_pdf_sha256,
-                i.danfse_pdf_received_at,
                 a.id AS artifact_id,
                 a.nsu,
                 a.document_type,
@@ -359,9 +362,17 @@ class SqliteRepository:
                 END AS "Valor",
                 i.competence_date AS "Competencia",
                 a.xml_content AS "XML",
-                i.danfse_pdf AS "DANFe PDF",
-                i.danfse_pdf_status AS "Status DANFe PDF",
                 i.access_key AS "Chave de Acesso",
+                (
+                    SELECT fe.event_code
+                    FROM fiscal_event fe
+                    WHERE fe.unit_id = i.unit_id
+                      AND fe.invoice_access_key = i.access_key
+                      AND fe.event_code IS NOT NULL
+                      AND fe.event_code <> ''
+                    ORDER BY COALESCE(fe.occurred_at, fe.created_at) DESC, fe.id DESC
+                    LIMIT 1
+                ) AS "Codigo do Evento",
                 a.nsu AS "NSU"
             FROM invoice i
             JOIN fiscal_unit u ON u.id = i.unit_id
@@ -406,21 +417,14 @@ class SqliteRepository:
         self._add_column(connection, "dfe_artifact", "xml_content", "BLOB")
         self._add_column(connection, "invoice", "contract_id", "INTEGER")
         self._add_column(connection, "invoice", "contract_number", "TEXT")
-        self._add_column(connection, "invoice", "danfse_pdf", "BLOB")
-        self._add_column(connection, "invoice", "danfse_pdf_sha256", "TEXT")
-        self._add_column(
-            connection,
-            "invoice",
-            "danfse_pdf_status",
-            "TEXT NOT NULL DEFAULT 'PENDENTE'",
-        )
-        self._add_column(connection, "invoice", "danfse_pdf_received_at", "TEXT")
         self._add_column(connection, "distribution_cursor", "history_target_nsu", "INTEGER")
         self._add_column(connection, "distribution_cursor", "history_backfilled_at", "TEXT")
         self._add_column(connection, "collection_run", "job_id", "TEXT")
         self._add_column(
             connection, "collection_run", "ignored_documents", "INTEGER NOT NULL DEFAULT 0"
         )
+        self._add_column(connection, "fiscal_event", "event_code", "TEXT")
+        self._remove_pdf_storage(connection)
 
         rows = connection.execute(
             "SELECT id, xml_gzip FROM dfe_artifact WHERE xml_content IS NULL"
@@ -436,6 +440,119 @@ class SqliteRepository:
                 "UPDATE dfe_artifact SET xml_content = ? WHERE id = ?",
                 (xml_content, int(row["id"])),
             )
+        self._reconcile_fiscal_events(connection)
+
+    @staticmethod
+    def _remove_pdf_storage(connection: sqlite3.Connection) -> None:
+        obsolete_columns = {
+            "invoice": (
+                "danfse_pdf",
+                "danfse_pdf_sha256",
+                "danfse_pdf_status",
+                "danfse_pdf_received_at",
+            ),
+            "collection_job": ("danfse_pdfs_stored",),
+        }
+        existing = {
+            table: {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for table in obsolete_columns
+        }
+        if not any(
+            column in existing[table]
+            for table, columns in obsolete_columns.items()
+            for column in columns
+        ):
+            return
+
+        connection.executescript(
+            """
+            DROP VIEW IF EXISTS vw_invoice_outbox;
+            DROP VIEW IF EXISTS vw_notas_fiscais;
+            """
+        )
+        for table, columns in obsolete_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    connection.execute(
+                        f'ALTER TABLE "{table}" DROP COLUMN "{column}"'
+                    )
+        connection.commit()
+        connection.execute("VACUUM")
+
+    def _reconcile_fiscal_events(self, connection: sqlite3.Connection) -> None:
+        """Reclassifica eventos nacionais gravados antes do suporte aos grupos eNNNNNN."""
+        from taxlink_nfse.parser import NationalNfseParser
+
+        rows = connection.execute(
+            """
+            SELECT
+                fe.id,
+                fe.unit_id,
+                fe.invoice_access_key,
+                fe.event_code,
+                a.xml_content
+            FROM fiscal_event fe
+            JOIN dfe_artifact a ON a.id = fe.source_artifact_id
+            WHERE a.xml_content IS NOT NULL
+              AND (
+                    (
+                        (fe.event_code IS NULL OR fe.event_code = '')
+                        AND fe.event_type <> 'NFSE'
+                    )
+                    OR fe.event_type = 'EVENTO'
+                  )
+            """
+        ).fetchall()
+        parser = NationalNfseParser()
+        now = iso_utc()
+        event_code_refreshes: set[tuple[int, str]] = set()
+        status_refreshes: set[tuple[int, str]] = set()
+        for row in rows:
+            try:
+                root = ET.fromstring(bytes(row["xml_content"]))
+            except (ET.ParseError, TypeError, ValueError):
+                continue
+            event = parser.parse_fiscal_event(
+                root,
+                str(row["invoice_access_key"] or ""),
+            )
+            if event is None:
+                continue
+            connection.execute(
+                """
+                UPDATE fiscal_event
+                SET event_code = COALESCE(NULLIF(?, ''), event_code),
+                    event_type = ?, occurred_at = COALESCE(?, occurred_at),
+                    protocol = COALESCE(?, protocol), status = COALESCE(?, status)
+                WHERE id = ?
+                """,
+                (
+                    event.event_code,
+                    event.event_type,
+                    event.occurred_at or None,
+                    event.protocol or None,
+                    event.status or None,
+                    int(row["id"]),
+                ),
+            )
+            access_key = event.invoice_access_key or str(row["invoice_access_key"] or "")
+            refresh_key = (int(row["unit_id"]), access_key)
+            if event.event_code and event.event_code != str(row["event_code"] or ""):
+                event_code_refreshes.add(refresh_key)
+            if self._apply_fiscal_event_status(
+                connection,
+                int(row["unit_id"]),
+                access_key,
+                event.event_type,
+                now,
+            ):
+                status_refreshes.add(refresh_key)
+
+        for unit_id, access_key in event_code_refreshes - status_refreshes:
+            self._enqueue_invoice_refresh(connection, unit_id, access_key, now)
 
     @staticmethod
     def _add_column(
@@ -821,7 +938,7 @@ class SqliteRepository:
                 SET status = ?, finished_at = ?, units_processed = ?,
                     requested_batches = ?, received_documents = ?,
                     stored_documents = ?, ignored_documents = ?,
-                    danfse_pdfs_stored = ?, error_count = ?
+                    error_count = ?
                 WHERE id = ?
                 """,
                 (
@@ -832,7 +949,6 @@ class SqliteRepository:
                     int(summary.get("documents_received", 0)),
                     int(summary.get("documents_stored", 0)),
                     int(summary.get("documents_ignored", 0)),
-                    int(summary.get("danfse_pdfs_stored", 0)),
                     errors,
                     job_id,
                 ),
@@ -1015,6 +1131,12 @@ class SqliteRepository:
     ) -> None:
         invoice = document.invoice
         assert invoice is not None
+        fiscal_status = self._resolved_fiscal_status(
+            connection,
+            unit_id,
+            invoice.access_key,
+            invoice.status,
+        )
         existing = connection.execute(
             "SELECT id, version, source_artifact_id FROM invoice WHERE unit_id = ? AND access_key = ?",
             (unit_id, invoice.access_key),
@@ -1047,7 +1169,7 @@ class SqliteRepository:
                     invoice.service_description or None,
                     invoice.service_amount_cents,
                     invoice.net_amount_cents,
-                    invoice.status,
+                    fiscal_status,
                     version,
                     now,
                     now,
@@ -1057,72 +1179,36 @@ class SqliteRepository:
         else:
             invoice_id = int(existing["id"])
             version = int(existing["version"]) + 1
-            old_artifact_id = int(existing["source_artifact_id"]) if existing["source_artifact_id"] is not None else None
-            reset_pdf = old_artifact_id is not None and old_artifact_id != artifact_id
-
-            if reset_pdf:
-                connection.execute(
-                    """
-                    UPDATE invoice
-                    SET source_artifact_id = ?, document_number = ?, series = ?, issued_at = ?,
-                        competence_date = ?, provider_tax_id = ?, provider_name = ?,
-                        taker_tax_id = ?, taker_name = ?, service_code = ?,
-                        service_description = ?, service_amount_cents = ?, net_amount_cents = ?,
-                        fiscal_status = ?, danfse_pdf = NULL, danfse_pdf_sha256 = NULL,
-                        danfse_pdf_status = NULL, version = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        artifact_id,
-                        invoice.document_number or None,
-                        invoice.series or None,
-                        invoice.issued_at or None,
-                        invoice.competence_date or None,
-                        invoice.provider_tax_id or None,
-                        invoice.provider_name or None,
-                        invoice.taker_tax_id or None,
-                        invoice.taker_name or None,
-                        invoice.service_code or None,
-                        invoice.service_description or None,
-                        invoice.service_amount_cents,
-                        invoice.net_amount_cents,
-                        invoice.status,
-                        version,
-                        now,
-                        invoice_id,
-                    ),
-                )
-            else:
-                connection.execute(
-                    """
-                    UPDATE invoice
-                    SET source_artifact_id = ?, document_number = ?, series = ?, issued_at = ?,
-                        competence_date = ?, provider_tax_id = ?, provider_name = ?,
-                        taker_tax_id = ?, taker_name = ?, service_code = ?,
-                        service_description = ?, service_amount_cents = ?, net_amount_cents = ?,
-                        fiscal_status = ?, version = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        artifact_id,
-                        invoice.document_number or None,
-                        invoice.series or None,
-                        invoice.issued_at or None,
-                        invoice.competence_date or None,
-                        invoice.provider_tax_id or None,
-                        invoice.provider_name or None,
-                        invoice.taker_tax_id or None,
-                        invoice.taker_name or None,
-                        invoice.service_code or None,
-                        invoice.service_description or None,
-                        invoice.service_amount_cents,
-                        invoice.net_amount_cents,
-                        invoice.status,
-                        version,
-                        now,
-                        invoice_id,
-                    ),
-                )
+            connection.execute(
+                """
+                UPDATE invoice
+                SET source_artifact_id = ?, document_number = ?, series = ?, issued_at = ?,
+                    competence_date = ?, provider_tax_id = ?, provider_name = ?,
+                    taker_tax_id = ?, taker_name = ?, service_code = ?,
+                    service_description = ?, service_amount_cents = ?, net_amount_cents = ?,
+                    fiscal_status = ?, version = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    artifact_id,
+                    invoice.document_number or None,
+                    invoice.series or None,
+                    invoice.issued_at or None,
+                    invoice.competence_date or None,
+                    invoice.provider_tax_id or None,
+                    invoice.provider_name or None,
+                    invoice.taker_tax_id or None,
+                    invoice.taker_name or None,
+                    invoice.service_code or None,
+                    invoice.service_description or None,
+                    invoice.service_amount_cents,
+                    invoice.net_amount_cents,
+                    fiscal_status,
+                    version,
+                    now,
+                    invoice_id,
+                ),
+            )
 
         connection.execute("DELETE FROM invoice_item WHERE invoice_id = ?", (invoice_id,))
         connection.executemany(
@@ -1168,14 +1254,16 @@ class SqliteRepository:
             """
             INSERT OR IGNORE INTO fiscal_event (
                 unit_id, source_artifact_id, invoice_access_key, event_key,
-                event_type, event_sequence, occurred_at, protocol, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                event_code, event_type, event_sequence, occurred_at, protocol,
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 unit_id,
                 artifact_id,
                 evt.invoice_access_key or None,
                 event_key,
+                evt.event_code or None,
                 evt.event_type,
                 evt.event_sequence,
                 evt.occurred_at or None,
@@ -1185,94 +1273,105 @@ class SqliteRepository:
             ),
         )
         if evt.invoice_access_key and evt.event_type in ("CANCELAMENTO", "SUBSTITUICAO"):
-            new_status = "CANCELADA" if evt.event_type == "CANCELAMENTO" else "SUBSTITUIDA"
-            row = connection.execute(
-                "SELECT id, version FROM invoice WHERE unit_id = ? AND access_key = ?",
-                (unit_id, evt.invoice_access_key),
-            ).fetchone()
-            if row is not None:
-                inv_id = int(row["id"])
-                ver = int(row["version"]) + 1
-                connection.execute(
-                    "UPDATE invoice SET fiscal_status = ?, version = ?, updated_at = ? WHERE id = ?",
-                    (new_status, ver, now, inv_id),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO integration_outbox (
-                        aggregate_type, aggregate_id, operation, aggregate_version, created_at
-                    ) VALUES ('INVOICE', ?, 'UPSERT', ?, ?)
-                    """,
-                    (inv_id, ver, now),
-                )
+            self._apply_fiscal_event_status(
+                connection,
+                unit_id,
+                evt.invoice_access_key,
+                evt.event_type,
+                now,
+            )
 
-    def pending_danfse(self, unit_code: str, limit: int = 50) -> list[dict[str, Any]]:
-        with self.connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT
-                    i.id AS invoice_id,
-                    i.access_key,
-                    i.danfse_pdf_status,
-                    a.xml_content AS xml_bytes
-                FROM invoice i
-                JOIN fiscal_unit u ON u.id = i.unit_id
-                JOIN dfe_artifact a ON a.id = i.source_artifact_id
-                WHERE u.code = ? AND i.danfse_pdf IS NULL
-                  AND (i.danfse_pdf_status IS NULL OR i.danfse_pdf_status NOT LIKE 'FALHA%')
-                ORDER BY i.id
-                LIMIT ?
-                """,
-                (unit_code, max(1, int(limit))),
-            ).fetchall()
-            return [dict(row) for row in rows]
+    @staticmethod
+    def _resolved_fiscal_status(
+        connection: sqlite3.Connection,
+        unit_id: int,
+        access_key: str,
+        default_status: str,
+    ) -> str:
+        row = connection.execute(
+            """
+            SELECT event_type
+            FROM fiscal_event
+            WHERE unit_id = ? AND invoice_access_key = ?
+              AND event_type IN ('CANCELAMENTO', 'SUBSTITUICAO')
+            ORDER BY COALESCE(occurred_at, created_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (unit_id, access_key),
+        ).fetchone()
+        if row is None:
+            return default_status
+        return "CANCELADA" if row["event_type"] == "CANCELAMENTO" else "SUBSTITUIDA"
 
-    def save_danfse(
-        self,
-        invoice_id: int,
-        status: str,
-        pdf_bytes: bytes | None,
+    @staticmethod
+    def _apply_fiscal_event_status(
+        connection: sqlite3.Connection,
+        unit_id: int,
+        access_key: str,
+        event_type: str,
+        now: str,
     ) -> bool:
-        now = iso_utc()
-        pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest() if pdf_bytes else None
-        with self.transaction(immediate=True) as connection:
-            existing = connection.execute(
-                """
-                SELECT danfse_pdf_sha256, danfse_pdf_status, version
-                FROM invoice WHERE id = ?
-                """,
-                (invoice_id,),
-            ).fetchone()
-            if existing is None:
-                raise RepositoryError(f"NFS-e nao encontrada para salvar DANFSe: {invoice_id}")
-            if (
-                existing["danfse_pdf_sha256"] == pdf_sha256
-                and str(existing["danfse_pdf_status"]) == status
-            ):
-                return False
+        if not access_key or event_type not in ("CANCELAMENTO", "SUBSTITUICAO"):
+            return False
+        new_status = "CANCELADA" if event_type == "CANCELAMENTO" else "SUBSTITUIDA"
+        row = connection.execute(
+            """
+            SELECT id, version, fiscal_status
+            FROM invoice
+            WHERE unit_id = ? AND access_key = ?
+            """,
+            (unit_id, access_key),
+        ).fetchone()
+        if row is None or str(row["fiscal_status"]) == new_status:
+            return False
+        invoice_id = int(row["id"])
+        version = int(row["version"]) + 1
+        connection.execute(
+            "UPDATE invoice SET fiscal_status = ?, version = ?, updated_at = ? WHERE id = ?",
+            (new_status, version, now, invoice_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO integration_outbox (
+                aggregate_type, aggregate_id, operation, aggregate_version, created_at
+            ) VALUES ('INVOICE', ?, 'UPSERT', ?, ?)
+            """,
+            (invoice_id, version, now),
+        )
+        return True
 
-            version = int(existing["version"]) + 1
-            connection.execute(
-                """
-                UPDATE invoice
-                SET danfse_pdf = COALESCE(?, danfse_pdf),
-                    danfse_pdf_sha256 = COALESCE(?, danfse_pdf_sha256),
-                    danfse_pdf_status = ?,
-                    danfse_pdf_received_at = CASE WHEN ? IS NULL THEN danfse_pdf_received_at ELSE ? END,
-                    version = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (pdf_bytes, pdf_sha256, status, pdf_bytes, now, version, now, invoice_id),
-            )
-            connection.execute(
-                """
-                INSERT INTO integration_outbox (
-                    aggregate_type, aggregate_id, operation, aggregate_version, created_at
-                ) VALUES ('INVOICE', ?, 'UPSERT', ?, ?)
-                """,
-                (invoice_id, version, now),
-            )
-            return True
+    @staticmethod
+    def _enqueue_invoice_refresh(
+        connection: sqlite3.Connection,
+        unit_id: int,
+        access_key: str,
+        now: str,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT id, version
+            FROM invoice
+            WHERE unit_id = ? AND access_key = ?
+            """,
+            (unit_id, access_key),
+        ).fetchone()
+        if row is None:
+            return False
+        invoice_id = int(row["id"])
+        version = int(row["version"]) + 1
+        connection.execute(
+            "UPDATE invoice SET version = ?, updated_at = ? WHERE id = ?",
+            (version, now, invoice_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO integration_outbox (
+                aggregate_type, aggregate_id, operation, aggregate_version, created_at
+            ) VALUES ('INVOICE', ?, 'UPSERT', ?, ?)
+            """,
+            (invoice_id, version, now),
+        )
+        return True
 
     def link_contract(
         self, invoice_id: int, contract_id: int, contract_number: str
@@ -1468,8 +1567,6 @@ class SqliteRepository:
                     (SELECT COUNT(*) FROM dfe_artifact a WHERE a.unit_id = u.id) AS artifacts,
                     (SELECT COUNT(*) FROM invoice i WHERE i.unit_id = u.id) AS invoices,
                     (SELECT COUNT(*) FROM invoice i WHERE i.unit_id = u.id
-                        AND i.danfse_pdf IS NOT NULL) AS danfse_pdfs,
-                    (SELECT COUNT(*) FROM invoice i WHERE i.unit_id = u.id
                         AND i.contract_id IS NOT NULL) AS linked_contracts,
                     (SELECT COUNT(*) FROM integration_outbox o
                         JOIN invoice oi ON o.aggregate_type = 'INVOICE'
@@ -1490,8 +1587,7 @@ class SqliteRepository:
                     i.contract_id, i.contract_number, a.nsu, i.access_key,
                     i.document_number, i.issued_at, i.competence_date,
                     i.provider_tax_id, i.provider_name, i.service_amount_cents,
-                    i.fiscal_status, length(a.xml_content) AS xml_bytes,
-                    length(i.danfse_pdf) AS pdf_bytes, i.danfse_pdf_status
+                    i.fiscal_status, length(a.xml_content) AS xml_bytes
                 FROM invoice i
                 JOIN fiscal_unit u ON u.id = i.unit_id
                 JOIN dfe_artifact a ON a.id = i.source_artifact_id

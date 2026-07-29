@@ -155,7 +155,6 @@ def run(argv: list[str] | None = None) -> int:
                 total_batches = 0
                 total_received = 0
                 total_stored = 0
-                total_pdfs = 0
                 for _ in range(1000):
                     before = int(repository.cursor(unit.code)["next_nsu"])
                     summary = collector.run_cycle(force=True)
@@ -163,7 +162,6 @@ def run(argv: list[str] | None = None) -> int:
                     total_batches += summary.batches_requested
                     total_received += summary.documents_received
                     total_stored += summary.documents_stored
-                    total_pdfs += summary.danfse_pdfs_stored
                     if summary.errors or after <= before or after >= target_nsu:
                         break
                 final_nsu = int(repository.cursor(unit.code)["next_nsu"])
@@ -180,7 +178,6 @@ def run(argv: list[str] | None = None) -> int:
                             "batches_requested": total_batches,
                             "documents_received": total_received,
                             "documents_stored": total_stored,
-                            "danfse_pdfs_stored": total_pdfs,
                             "status": "COMPLETED" if completed else "INCOMPLETE",
                         }
                     )

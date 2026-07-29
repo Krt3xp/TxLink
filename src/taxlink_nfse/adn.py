@@ -7,7 +7,7 @@ from typing import Any, Mapping
 from urllib.parse import urlencode
 
 from taxlink_nfse.config import AdnConfig, CollectorConfig, UnitConfig
-from taxlink_nfse.domain import DanfseResult, FetchResult
+from taxlink_nfse.domain import FetchResult
 from taxlink_nfse.parser import DfeDecoder
 from taxlink_nfse.transport import HttpResponse, HttpTransport, MutualTlsTransport
 
@@ -59,15 +59,6 @@ class AdnClient:
             http_status=response.status_code,
             documents=documents,
         )
-
-    def fetch_danfse(self, unit: UnitConfig, access_key: str) -> DanfseResult:
-        base_url = self.adn_config.danfse_base_url_for(unit.environment)
-        response = self._get_with_retry(f"{base_url}/{access_key}", unit)
-        if response.status_code == 200 and response.body.startswith(b"%PDF-"):
-            return DanfseResult("BAIXADO_OFICIAL", 200, response.body)
-        if response.status_code == 200:
-            return DanfseResult("PDF_OFICIAL_INVALIDO", 200)
-        return DanfseResult(f"NAO_DISPONIVEL_{response.status_code}", response.status_code)
 
     def _get_with_retry(self, url: str, unit: UnitConfig) -> HttpResponse:
         last_error: Exception | None = None

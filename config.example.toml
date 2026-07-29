@@ -41,10 +41,7 @@ timeout_seconds = 60
 [adn]
 production_base_url = "https://adn.nfse.gov.br/contribuintes"
 restricted_base_url = "https://adn.producaorestrita.nfse.gov.br/contribuintes"
-production_danfse_base_url = "https://adn.nfse.gov.br/danfse"
-restricted_danfse_base_url = "https://adn.producaorestrita.nfse.gov.br/danfse"
 batch_mode = true
-download_danfse_pdf = true
 
 [[units]]
 code = "unidade-1"

@@ -74,7 +74,77 @@ class ParserTests(unittest.TestCase):
         evt = document.fiscal_event
         assert evt is not None
         self.assertEqual(evt.event_type, "CANCELAMENTO")
+        self.assertEqual(evt.event_code, "110111")
         self.assertEqual(evt.invoice_access_key, "330455705029600000368000000000000000000000001")
+
+    def test_parses_national_cancellation_event_group(self) -> None:
+        canc_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<evento xmlns="http://www.sped.fazenda.gov.br/nfse" versao="1.01">
+  <infEvento>
+    <nSeqEvento>1</nSeqEvento>
+    <pedRegEvento>
+      <infPedReg>
+        <dhEvento>2026-07-28T09:59:24-03:00</dhEvento>
+        <chNFSe>330455705029600000368000000000000000000000001</chNFSe>
+        <e101101>
+          <xDesc>Cancelamento de NFS-e</xDesc>
+          <cMotivo>9</cMotivo>
+          <xMotivo>Erro na emissao</xMotivo>
+        </e101101>
+      </infPedReg>
+    </pedRegEvento>
+  </infEvento>
+</evento>
+"""
+        envelope = {
+            "NSU": 44,
+            "ChaveAcesso": "330455705029600000368000000000000000000000001",
+            "TipoDocumento": "EVENTO",
+            "ArquivoXml": base64.b64encode(gzip.compress(canc_xml)).decode("ascii"),
+        }
+
+        document = DfeDecoder().decode(envelope)
+
+        self.assertIsNotNone(document.fiscal_event)
+        event = document.fiscal_event
+        assert event is not None
+        self.assertEqual(event.event_type, "CANCELAMENTO")
+        self.assertEqual(event.event_code, "101101")
+        self.assertEqual(event.reason, "Erro na emissao")
+
+    def test_parses_national_substitution_event_group(self) -> None:
+        substitution_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<evento xmlns="http://www.sped.fazenda.gov.br/nfse" versao="1.01">
+  <infEvento>
+    <nSeqEvento>1</nSeqEvento>
+    <pedRegEvento>
+      <infPedReg>
+        <dhEvento>2026-07-28T10:00:00-03:00</dhEvento>
+        <chNFSe>330455705029600000368000000000000000000000001</chNFSe>
+        <e105102>
+          <xDesc>Cancelamento de NFS-e por Substituicao</xDesc>
+          <cMotivo>99</cMotivo>
+          <chSubstituta>330455705029600000368000000000000000000000002</chSubstituta>
+        </e105102>
+      </infPedReg>
+    </pedRegEvento>
+  </infEvento>
+</evento>
+"""
+        envelope = {
+            "NSU": 45,
+            "ChaveAcesso": "330455705029600000368000000000000000000000001",
+            "TipoDocumento": "EVENTO",
+            "ArquivoXml": base64.b64encode(gzip.compress(substitution_xml)).decode("ascii"),
+        }
+
+        document = DfeDecoder().decode(envelope)
+
+        self.assertIsNotNone(document.fiscal_event)
+        event = document.fiscal_event
+        assert event is not None
+        self.assertEqual(event.event_type, "SUBSTITUICAO")
+        self.assertEqual(event.event_code, "105102")
 
 
 if __name__ == "__main__":

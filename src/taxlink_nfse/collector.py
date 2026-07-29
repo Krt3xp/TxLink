@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 
 from taxlink_nfse.adn import AdnClient
 from taxlink_nfse.config import AppConfig, UnitConfig
-from taxlink_nfse.danfse import DanfsePdfGenerator
 from taxlink_nfse.storage import SqliteRepository
 
 
@@ -17,7 +16,6 @@ class CycleSummary:
     documents_received: int = 0
     documents_stored: int = 0
     documents_ignored: int = 0
-    danfse_pdfs_stored: int = 0
     errors: int = 0
 
     def as_dict(self) -> dict[str, int]:
@@ -27,7 +25,6 @@ class CycleSummary:
             "documents_received": self.documents_received,
             "documents_stored": self.documents_stored,
             "documents_ignored": self.documents_ignored,
-            "danfse_pdfs_stored": self.danfse_pdfs_stored,
             "errors": self.errors,
         }
 
@@ -38,12 +35,10 @@ class Collector:
         config: AppConfig,
         repository: SqliteRepository | None = None,
         client: AdnClient | None = None,
-        danfse_generator: DanfsePdfGenerator | None = None,
     ):
         self.config = config
         self.repository = repository or SqliteRepository(config.collector.database_path)
         self.client = client or AdnClient(config.adn, config.collector)
-        self.danfse_generator = danfse_generator or DanfsePdfGenerator()
         self.logger = logging.getLogger(__name__)
 
     def initialize(self) -> None:
@@ -119,9 +114,6 @@ class Collector:
                 summary.documents_ignored += ignored
             else:
                 result = "PARTIAL"
-
-            if self.config.adn.download_danfse_pdf:
-                summary.danfse_pdfs_stored += self._download_pending_danfse(unit)
         except Exception as exc:
             summary.errors += 1
             result = "ERROR"
@@ -145,63 +137,6 @@ class Collector:
                 error_message,
                 max(0, received_documents - stored_documents),
             )
-
-    def _download_pending_danfse(self, unit: UnitConfig) -> int:
-        stored = 0
-        for pending in self.repository.pending_danfse(unit.code):
-            invoice_id = int(pending["invoice_id"])
-            access_key = str(pending["access_key"])
-            official_status = "ERRO_AO_CONSULTAR_PDF_OFICIAL"
-            try:
-                result = self.client.fetch_danfse(unit, access_key)
-                official_status = result.status
-                if result.pdf_bytes:
-                    self.repository.save_danfse(
-                        invoice_id, result.status, result.pdf_bytes
-                    )
-                    stored += 1
-                    self.logger.info(
-                        "DANFSe oficial armazenado unidade=%s chave=%s",
-                        unit.code,
-                        access_key,
-                    )
-                    continue
-            except Exception as exc:
-                self.logger.warning(
-                    "Falha ao consultar DANFSe oficial unidade=%s chave=%s: %s",
-                    unit.code,
-                    access_key,
-                    exc,
-                )
-
-            try:
-                xml_bytes = bytes(pending["xml_bytes"] or b"")
-                generated_pdf = self.danfse_generator.generate(
-                    xml_bytes, access_key=access_key
-                )
-                self.repository.save_danfse(
-                    invoice_id, "GERADO_DO_XML", generated_pdf
-                )
-                stored += 1
-                self.logger.info(
-                    "DANFSe gerado do XML unidade=%s chave=%s status_oficial=%s",
-                    unit.code,
-                    access_key,
-                    official_status,
-                )
-            except Exception as exc:
-                self.repository.save_danfse(
-                    invoice_id,
-                    f"FALHA_GERACAO_XML_APOS_{official_status}"[:120],
-                    None,
-                )
-                self.logger.warning(
-                    "Falha ao gerar DANFSe do XML unidade=%s chave=%s: %s",
-                    unit.code,
-                    access_key,
-                    exc,
-                )
-        return stored
 
     def run_forever(self) -> None:
         self.logger.info("Coletor NFS-e iniciado em modo continuo")

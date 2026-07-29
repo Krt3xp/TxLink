@@ -213,15 +213,38 @@ class NationalNfseParser:
         access_key = envelope_access_key or self.extract_access_key(root)
         root_tag = self.local_name(root.tag)
 
-        raw_event_type = self._find_text(
+        event_code = ""
+        event_description = ""
+        for element in root.iter():
+            element_name = self.local_name(element.tag)
+            match = re.fullmatch(r"e(\d{6})", element_name, flags=re.IGNORECASE)
+            if match:
+                event_code = match.group(1)
+                event_description = self._find_text(element, ("xDesc",))
+                break
+
+        declared_event_type = self._find_text(
             root, ("tpEvento",), ("xDescEvento",), ("tipoEvento",)
-        ) or root_tag
+        )
+        if not event_code and re.fullmatch(r"\d{6}", declared_event_type):
+            event_code = declared_event_type
+        raw_event_type = declared_event_type or event_code or event_description or root_tag
 
         event_type = raw_event_type.upper()
-        if "110111" in event_type or "CANCEL" in event_type or "CANCNFSE" in event_type:
-            event_type = "CANCELAMENTO"
-        elif "110112" in event_type or "SUBST" in event_type or "SUBNFSE" in event_type:
+        if (
+            event_code == "105102"
+            or "110112" in event_type
+            or "SUBST" in event_type
+            or "SUBNFSE" in event_type
+        ):
             event_type = "SUBSTITUICAO"
+        elif (
+            event_code in ("101101", "105104", "305101")
+            or "110111" in event_type
+            or "CANCEL" in event_type
+            or "CANCNFSE" in event_type
+        ):
+            event_type = "CANCELAMENTO"
 
         seq_text = self._find_text(root, ("nSeqEvento",), ("seqEvento",))
         try:
@@ -242,6 +265,7 @@ class NationalNfseParser:
         return ParsedFiscalEvent(
             invoice_access_key=access_key,
             event_type=event_type,
+            event_code=event_code,
             event_sequence=event_sequence,
             occurred_at=occurred_at,
             protocol=protocol,

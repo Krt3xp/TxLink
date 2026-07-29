@@ -199,20 +199,12 @@ class SyncConfig:
 class AdnConfig:
     production_base_url: str
     restricted_base_url: str
-    production_danfse_base_url: str
-    restricted_danfse_base_url: str
     batch_mode: bool
-    download_danfse_pdf: bool
 
     def base_url_for(self, environment: str) -> str:
         if environment == "production":
             return self.production_base_url.rstrip("/")
         return self.restricted_base_url.rstrip("/")
-
-    def danfse_base_url_for(self, environment: str) -> str:
-        if environment == "production":
-            return self.production_danfse_base_url.rstrip("/")
-        return self.restricted_danfse_base_url.rstrip("/")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,17 +268,7 @@ class AppConfig:
                     "https://adn.producaorestrita.nfse.gov.br/contribuintes",
                 )
             ).strip(),
-            production_danfse_base_url=str(
-                adn_raw.get("production_danfse_base_url", "https://adn.nfse.gov.br/danfse")
-            ).strip(),
-            restricted_danfse_base_url=str(
-                adn_raw.get(
-                    "restricted_danfse_base_url",
-                    "https://adn.producaorestrita.nfse.gov.br/danfse",
-                )
-            ).strip(),
             batch_mode=bool(adn_raw.get("batch_mode", True)),
-            download_danfse_pdf=bool(adn_raw.get("download_danfse_pdf", True)),
         )
         api = ApiConfig(
             host=str(api_raw.get("host", "127.0.0.1")).strip(),
