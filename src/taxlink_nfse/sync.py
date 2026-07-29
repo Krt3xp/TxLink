@@ -27,8 +27,6 @@ class MirrorSyncService:
         self.logger = logging.getLogger(__name__)
 
     def enqueue(self, trigger_source: str) -> str:
-        if not self.config.enabled:
-            raise RuntimeError("A sincronizacao SFTP esta desabilitada.")
         return self.repository.create_sync_run(trigger_source)
 
     def execute(self, sync_id: str) -> bool:
@@ -38,7 +36,11 @@ class MirrorSyncService:
             if not self.repository.claim_sync_run(sync_id):
                 return False
             mirror_path, size_bytes, digest = self.create_consistent_snapshot()
-            remote_path = self.transfer_atomic(mirror_path)
+            if self.config.enabled:
+                remote_path = self.transfer_atomic(mirror_path)
+            else:
+                remote_path = "LOCAL_ONLY"
+                self.logger.info("Espelho local gerado em %s (SFTP desabilitado)", mirror_path)
             self.repository.finish_sync_run(
                 sync_id,
                 str(mirror_path),
