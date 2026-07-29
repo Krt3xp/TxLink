@@ -12,6 +12,7 @@ A versao 0.2 adiciona a base da operacao no Ubuntu Linux:
 - fila persistente de coletas com `execution_id` UUID;
 - scheduler diario com APScheduler;
 - certificado A1 PFX ou PEM registrado no SQLite;
+- validade e thumbprint extraidos do certificado de arquivo;
 - snapshot consistente pela API nativa de backup do SQLite;
 - envio SFTP com Paramiko e renomeacao atomica no Windows OpenSSH;
 - unidade de servico systemd em `packaging/taxlink-collector.service`.
@@ -44,6 +45,11 @@ O SFTP permanece desabilitado no exemplo ate que host, usuario, `known_hosts`
 e credencial do Windows Server sejam preenchidos. A aplicacao exige suporte a
 `posix-rename` no servidor SFTP e falha de forma segura se a troca atomica nao
 estiver disponivel.
+
+A view `vw_certificados_digitais` apresenta o caminho do certificado no
+servidor Ubuntu, thumbprint, inicio/fim da validade e situacao. Para PFX e PEM,
+`store_location` permanece nulo; esse campo existe apenas para o provedor
+Windows legado.
 
 O projeto de referencia em `C:\Users\edrma\TaxLink\python-taxlink` foi usado
 somente para confirmar o fluxo de certificado Windows e os enderecos da API.
@@ -185,8 +191,10 @@ A view `vw_notas_fiscais` apresenta a consulta operacional consolidada com:
 - ID interno da NFS-e;
 - CNPJ da unidade e do fornecedor;
 - emissao, valor e competencia;
-- XML nacional sem compactacao e DANFSe oficial em PDF, ambos como BLOB;
-- chave de acesso, NSU e estado do download do DANFSe.
+- XML nacional sem compactacao e DANFSe em PDF, ambos como BLOB;
+- chave de acesso, NSU e origem/estado do DANFSe: `BAIXADO_OFICIAL` quando
+  retornado pelo ADN ou `GERADO_DO_XML` quando o PDF oficial estiver
+  indisponivel.
 
 Exemplo sem imprimir os arquivos binarios no terminal:
 

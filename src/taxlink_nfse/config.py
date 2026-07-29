@@ -8,8 +8,14 @@ from typing import Any
 
 
 def normalize_tax_id(value: object) -> str:
-    """Normaliza CPF/CNPJ sem assumir que o identificador sera sempre numerico."""
-    return re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper()
+    """Normaliza CPF/CNPJ aplicando pad de zeros a esquerda se for numerico."""
+    cleaned = re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper()
+    if cleaned.isdigit():
+        if 11 < len(cleaned) <= 14:
+            return cleaned.zfill(14)
+        if 0 < len(cleaned) <= 11:
+            return cleaned.zfill(11)
+    return cleaned
 
 
 def normalize_thumbprint(value: object) -> str:

@@ -5,12 +5,13 @@ import os
 project_root = os.path.dirname(SPECPATH)
 entrypoint = os.path.join(project_root, "src", "taxlink_nfse", "__main__.py")
 source_root = os.path.join(project_root, "src")
+nfse_logo = os.path.join(source_root, "taxlink_nfse", "assets", "nfse_logo.png")
 
 a = Analysis(
     [entrypoint],
     pathex=[source_root],
     binaries=[],
-    datas=[],
+    datas=[(nfse_logo, os.path.join("taxlink_nfse", "assets"))],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

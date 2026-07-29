@@ -9,3 +9,7 @@ dist/
 data/
 logs/
 config.toml
+certificates/
+*.pdf
+*.xml
+*.db

@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable, Mapping, Sequence
 
 from taxlink_nfse.config import normalize_tax_id
-from taxlink_nfse.domain import DecodedDfe, InvoiceItem, ParsedInvoice
+from taxlink_nfse.domain import DecodedDfe, InvoiceItem, ParsedFiscalEvent, ParsedInvoice
 
 
 class DfeDecodeError(ValueError):
@@ -53,6 +53,10 @@ class DfeDecoder:
         if invoice and not access_key:
             access_key = invoice.access_key
 
+        fiscal_event = None
+        if invoice is None:
+            fiscal_event = parser.parse_fiscal_event(root, access_key)
+
         return DecodedDfe(
             nsu=nsu,
             access_key=access_key,
@@ -63,6 +67,7 @@ class DfeDecoder:
             xml_sha256=hashlib.sha256(xml_bytes).hexdigest(),
             generated_at=generated_at,
             invoice=invoice,
+            fiscal_event=fiscal_event,
         )
 
     @staticmethod
@@ -202,6 +207,46 @@ class NationalNfseParser:
             net_amount_cents=net_amount,
             status=self._status(info),
             items=items,
+        )
+
+    def parse_fiscal_event(self, root: ET.Element, envelope_access_key: str = "") -> ParsedFiscalEvent | None:
+        access_key = envelope_access_key or self.extract_access_key(root)
+        root_tag = self.local_name(root.tag)
+
+        raw_event_type = self._find_text(
+            root, ("tpEvento",), ("xDescEvento",), ("tipoEvento",)
+        ) or root_tag
+
+        event_type = raw_event_type.upper()
+        if "110111" in event_type or "CANCEL" in event_type or "CANCNFSE" in event_type:
+            event_type = "CANCELAMENTO"
+        elif "110112" in event_type or "SUBST" in event_type or "SUBNFSE" in event_type:
+            event_type = "SUBSTITUICAO"
+
+        seq_text = self._find_text(root, ("nSeqEvento",), ("seqEvento",))
+        try:
+            event_sequence = int(seq_text) if seq_text else 1
+        except ValueError:
+            event_sequence = 1
+
+        occurred_at = normalize_datetime(
+            self._find_text(root, ("dhEvento",), ("dhRecbto",), ("dhEmi",), ("dhProc",))
+        )
+        protocol = self._find_text(root, ("nProt",), ("nProtocolo",))
+        status = self._find_text(root, ("cStat",)) or "100"
+        reason = self._find_text(root, ("xJust",), ("xMotivo",), ("xDesc",))
+
+        if not access_key and event_type not in ("CANCELAMENTO", "SUBSTITUICAO") and not protocol:
+            return None
+
+        return ParsedFiscalEvent(
+            invoice_access_key=access_key,
+            event_type=event_type,
+            event_sequence=event_sequence,
+            occurred_at=occurred_at,
+            protocol=protocol,
+            status=status,
+            reason=reason,
         )
 
     def extract_access_key(self, root: ET.Element) -> str:

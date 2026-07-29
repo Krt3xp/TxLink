@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 from taxlink_nfse.adn import AdnClient
 from taxlink_nfse.config import AppConfig, UnitConfig
+from taxlink_nfse.danfse import DanfsePdfGenerator
 from taxlink_nfse.storage import SqliteRepository
 
 
@@ -37,10 +38,12 @@ class Collector:
         config: AppConfig,
         repository: SqliteRepository | None = None,
         client: AdnClient | None = None,
+        danfse_generator: DanfsePdfGenerator | None = None,
     ):
         self.config = config
         self.repository = repository or SqliteRepository(config.collector.database_path)
         self.client = client or AdnClient(config.adn, config.collector)
+        self.danfse_generator = danfse_generator or DanfsePdfGenerator()
         self.logger = logging.getLogger(__name__)
 
     def initialize(self) -> None:
@@ -148,24 +151,52 @@ class Collector:
         for pending in self.repository.pending_danfse(unit.code):
             invoice_id = int(pending["invoice_id"])
             access_key = str(pending["access_key"])
+            official_status = "ERRO_AO_CONSULTAR_PDF_OFICIAL"
             try:
                 result = self.client.fetch_danfse(unit, access_key)
-                self.repository.save_danfse(invoice_id, result.status, result.pdf_bytes)
+                official_status = result.status
                 if result.pdf_bytes:
+                    self.repository.save_danfse(
+                        invoice_id, result.status, result.pdf_bytes
+                    )
                     stored += 1
                     self.logger.info(
-                        "DANFSe armazenado unidade=%s chave=%s", unit.code, access_key
-                    )
-                else:
-                    self.logger.warning(
-                        "DANFSe indisponivel unidade=%s chave=%s status=%s",
+                        "DANFSe oficial armazenado unidade=%s chave=%s",
                         unit.code,
                         access_key,
-                        result.status,
                     )
+                    continue
             except Exception as exc:
                 self.logger.warning(
-                    "Falha acessoria ao baixar DANFSe unidade=%s chave=%s: %s",
+                    "Falha ao consultar DANFSe oficial unidade=%s chave=%s: %s",
+                    unit.code,
+                    access_key,
+                    exc,
+                )
+
+            try:
+                xml_bytes = bytes(pending["xml_bytes"] or b"")
+                generated_pdf = self.danfse_generator.generate(
+                    xml_bytes, access_key=access_key
+                )
+                self.repository.save_danfse(
+                    invoice_id, "GERADO_DO_XML", generated_pdf
+                )
+                stored += 1
+                self.logger.info(
+                    "DANFSe gerado do XML unidade=%s chave=%s status_oficial=%s",
+                    unit.code,
+                    access_key,
+                    official_status,
+                )
+            except Exception as exc:
+                self.repository.save_danfse(
+                    invoice_id,
+                    f"FALHA_GERACAO_XML_APOS_{official_status}"[:120],
+                    None,
+                )
+                self.logger.warning(
+                    "Falha ao gerar DANFSe do XML unidade=%s chave=%s: %s",
                     unit.code,
                     access_key,
                     exc,

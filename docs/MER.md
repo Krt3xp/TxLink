@@ -206,7 +206,7 @@ erDiagram
 |---|---|
 | `schema_version` | Controla as migracoes aplicadas ao SQLite. |
 | `fiscal_unit` | Unidade consultada no ADN, seu CNPJ, ambiente e referencia do certificado. Nao guarda senha ou chave privada. |
-| `digital_certificate` | Caminhos e metadados do A1 por unidade. Guarda apenas o nome da variavel da senha. |
+| `digital_certificate` | Caminhos e metadados do A1 por unidade. Extrai thumbprint e validade do PFX/PEM; guarda apenas o nome da variavel da senha. `store_location` e nulo para arquivos no Ubuntu e existe somente para compatibilidade Windows legada. |
 | `distribution_cursor` | Estado operacional por unidade: proximo NSU, tentativas, agendamento e progresso do backfill historico. |
 | `collection_job` | Fila persistente e estado publico de uma solicitacao da API, scheduler ou CLI. |
 | `collection_run` | Auditoria de cada ciclo, com lotes solicitados, documentos recebidos/salvos e eventual erro. |

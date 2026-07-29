@@ -52,6 +52,30 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(invoice.net_amount_cents, 140045)
         self.assertEqual(invoice.items[0].code, "010101")
 
+    def test_parses_cancellation_event(self) -> None:
+        canc_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<CancNfse xmlns="http://www.sped.fazenda.gov.br/nfse">
+  <chNFSe>330455705029600000368000000000000000000000001</chNFSe>
+  <tpEvento>110111</tpEvento>
+  <nSeqEvento>1</nSeqEvento>
+  <xMotivo>Cancelamento a pedido do tomador</xMotivo>
+</CancNfse>
+"""
+        envelope = {
+            "NSU": 43,
+            "ChaveAcesso": "330455705029600000368000000000000000000000001",
+            "TipoDocumento": "CancNfse",
+            "ArquivoXml": base64.b64encode(gzip.compress(canc_xml)).decode("ascii"),
+        }
+
+        document = DfeDecoder().decode(envelope)
+        self.assertIsNone(document.invoice)
+        self.assertIsNotNone(document.fiscal_event)
+        evt = document.fiscal_event
+        assert evt is not None
+        self.assertEqual(evt.event_type, "CANCELAMENTO")
+        self.assertEqual(evt.invoice_access_key, "330455705029600000368000000000000000000000001")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,15 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from pathlib import Path
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.x509.oid import NameOID
 from taxlink_nfse.api import create_app
 from taxlink_nfse.storage import SCHEMA_VERSION, SqliteRepository
 from taxlink_nfse.sync import MirrorSyncService
@@ -12,6 +20,78 @@ from tests.test_storage import sample_document, write_test_config
 
 
 class NewArchitectureTests(unittest.TestCase):
+    def test_extracts_pfx_validity_and_does_not_use_windows_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pfx_path = root / "certificate.pfx"
+            password = "test-password"
+            valid_from = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+            valid_until = valid_from + timedelta(days=365)
+            private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            subject = issuer = x509.Name(
+                [x509.NameAttribute(NameOID.COMMON_NAME, "TaxLink Test")]
+            )
+            certificate = (
+                x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(issuer)
+                .public_key(private_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(valid_from)
+                .not_valid_after(valid_until)
+                .sign(private_key, hashes.SHA256())
+            )
+            pfx_path.write_bytes(
+                pkcs12.serialize_key_and_certificates(
+                    b"taxlink-test",
+                    private_key,
+                    certificate,
+                    None,
+                    serialization.BestAvailableEncryption(password.encode()),
+                )
+            )
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f"""
+[collector]
+database_path = "data/test.sqlite3"
+log_path = "logs/test.log"
+
+[[units]]
+code = "u1"
+tax_id = "05029600000368"
+environment = "production"
+
+[units.certificate]
+provider = "pfx"
+pfx_path = "{pfx_path.as_posix()}"
+password_env = "TEST_PFX_PASSWORD"
+certificate_tax_id = "05029600000104"
+""".strip(),
+                encoding="utf-8",
+            )
+            from taxlink_nfse.config import AppConfig
+
+            config = AppConfig.load(config_path)
+            repository = SqliteRepository(config.collector.database_path)
+            with patch.dict("os.environ", {"TEST_PFX_PASSWORD": password}):
+                repository.initialize(config.units)
+            row = repository.certificates()[0]
+
+            self.assertEqual(row["provider"], "pfx")
+            self.assertIsNone(row["store_location"])
+            self.assertEqual(row["valid_from"], valid_from.isoformat(timespec="seconds"))
+            self.assertEqual(row["valid_until"], valid_until.isoformat(timespec="seconds"))
+            self.assertEqual(
+                row["thumbprint"], certificate.fingerprint(hashes.SHA1()).hex().upper()
+            )
+            with closing(sqlite3.connect(config.collector.database_path)) as connection:
+                presentation = connection.execute(
+                    'SELECT "Formato", "Arquivo no Servidor", "Situacao" '
+                    "FROM vw_certificados_digitais"
+                ).fetchone()
+            self.assertEqual(presentation, ("PFX", str(pfx_path), "VALIDO"))
+
     def test_registers_certificate_and_persistent_collection_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = write_test_config(Path(temp_dir))
