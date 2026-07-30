@@ -408,7 +408,9 @@ class SqliteRepository:
                 END AS "Situacao"
             FROM digital_certificate c
             JOIN fiscal_unit u ON u.id = c.unit_id;
-                    connection.execute(
+            """
+        )
+        connection.execute(
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, iso_utc()),
         )
