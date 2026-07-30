@@ -297,34 +297,19 @@ class SqliteRepository:
         self._migrate_schema(connection)
         connection.executescript(
             """
+            DROP VIEW IF EXISTS vw_nfse_export;
             DROP VIEW IF EXISTS vw_invoice_outbox;
             DROP VIEW IF EXISTS vw_notas_fiscais;
             DROP VIEW IF EXISTS vw_certificados_digitais;
 
-            CREATE VIEW vw_invoice_outbox AS
+            -- View principal: dados pertinentes para exportação ao Contratos.net
+            CREATE VIEW vw_nfse_export AS
             SELECT
-                o.id AS outbox_id,
-                o.operation,
-                o.aggregate_version,
-                o.created_at AS outbox_created_at,
-                u.code AS unit_code,
+                o.id              AS outbox_id,
                 u.system_unit_id,
-                u.tax_id AS unit_tax_id,
-                i.id AS invoice_id,
-                i.access_key,
-                i.document_number,
-                i.series,
-                i.issued_at,
-                i.competence_date,
-                i.provider_tax_id,
-                i.provider_name,
-                i.taker_tax_id,
-                i.taker_name,
-                i.service_code,
-                i.service_description,
-                i.service_amount_cents,
-                i.net_amount_cents,
-                i.fiscal_status,
+                i.provider_name   AS fornecedor,
+                i.provider_tax_id AS cnpj_fornecedor,
+                i.access_key      AS chave_acesso,
                 (
                     SELECT fe.event_code
                     FROM fiscal_event fe
@@ -334,35 +319,57 @@ class SqliteRepository:
                       AND fe.event_code <> ''
                     ORDER BY COALESCE(fe.occurred_at, fe.created_at) DESC, fe.id DESC
                     LIMIT 1
-                ) AS event_code,
-                i.contract_id,
-                i.contract_number,
-                a.id AS artifact_id,
+                )                 AS codigo_evento,
+                i.document_number AS numero_nota,
+                i.issued_at       AS emissao,
+                ROUND(CAST(i.service_amount_cents AS REAL) / 100.0, 2) AS valor_nfs,
+                a.xml_content     AS arquivo_xml,
                 a.nsu,
-                a.document_type,
-                a.schema_name,
-                a.xml_sha256
+                i.fiscal_status   AS situacao,
+                CASE WHEN i.sent_to_mysql_at IS NOT NULL THEN 1 ELSE 0 END AS enviado_mysql,
+                i.id              AS invoice_id,
+                i.sent_to_mysql_at
             FROM integration_outbox o
             JOIN invoice i
               ON o.aggregate_type = 'INVOICE' AND i.id = o.aggregate_id
             JOIN fiscal_unit u ON u.id = i.unit_id
             JOIN dfe_artifact a ON a.id = i.source_artifact_id;
 
+            -- Alias retrocompatível para código que ainda usa vw_invoice_outbox
+            CREATE VIEW vw_invoice_outbox AS
+            SELECT
+                outbox_id,
+                system_unit_id,
+                fornecedor      AS provider_name,
+                cnpj_fornecedor AS provider_tax_id,
+                chave_acesso    AS access_key,
+                codigo_evento   AS event_code,
+                numero_nota     AS document_number,
+                emissao         AS issued_at,
+                valor_nfs       AS valor_servico,
+                arquivo_xml     AS xml_content,
+                nsu,
+                situacao        AS fiscal_status,
+                enviado_mysql,
+                invoice_id,
+                sent_to_mysql_at
+            FROM vw_nfse_export;
+
             CREATE VIEW vw_notas_fiscais AS
             SELECT
-                i.contract_number AS "Contrato",
-                i.id AS "ID",
-                i.contract_id AS "Contrato ID",
-                u.tax_id AS "Unidade CNPJ",
-                i.provider_tax_id AS "Fornecedor CNPJ",
-                i.issued_at AS "Data de Emissao",
+                i.contract_number    AS "Contrato",
+                i.id                 AS "ID",
+                i.contract_id        AS "Contrato ID",
+                u.tax_id             AS "Unidade CNPJ",
+                i.provider_tax_id    AS "Fornecedor CNPJ",
+                i.issued_at          AS "Data de Emissao",
                 CASE
                     WHEN i.service_amount_cents IS NULL THEN NULL
                     ELSE i.service_amount_cents / 100.0
-                END AS "Valor",
-                i.competence_date AS "Competencia",
-                a.xml_content AS "XML",
-                i.access_key AS "Chave de Acesso",
+                END                  AS "Valor",
+                i.competence_date    AS "Competencia",
+                a.xml_content        AS "XML",
+                i.access_key         AS "Chave de Acesso",
                 (
                     SELECT fe.event_code
                     FROM fiscal_event fe
@@ -372,8 +379,9 @@ class SqliteRepository:
                       AND fe.event_code <> ''
                     ORDER BY COALESCE(fe.occurred_at, fe.created_at) DESC, fe.id DESC
                     LIMIT 1
-                ) AS "Codigo do Evento",
-                a.nsu AS "NSU"
+                )                    AS "Codigo do Evento",
+                a.nsu                AS "NSU",
+                CASE WHEN i.sent_to_mysql_at IS NOT NULL THEN 'Sim' ELSE 'Nao' END AS "Enviado MySQL"
             FROM invoice i
             JOIN fiscal_unit u ON u.id = i.unit_id
             JOIN dfe_artifact a ON a.id = i.source_artifact_id;
@@ -400,9 +408,7 @@ class SqliteRepository:
                 END AS "Situacao"
             FROM digital_certificate c
             JOIN fiscal_unit u ON u.id = c.unit_id;
-            """
-        )
-        connection.execute(
+                    connection.execute(
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, iso_utc()),
         )
@@ -417,6 +423,7 @@ class SqliteRepository:
         self._add_column(connection, "dfe_artifact", "xml_content", "BLOB")
         self._add_column(connection, "invoice", "contract_id", "INTEGER")
         self._add_column(connection, "invoice", "contract_number", "TEXT")
+        self._add_column(connection, "invoice", "sent_to_mysql_at", "TEXT")
         self._add_column(connection, "distribution_cursor", "history_target_nsu", "INTEGER")
         self._add_column(connection, "distribution_cursor", "history_backfilled_at", "TEXT")
         self._add_column(connection, "collection_run", "job_id", "TEXT")
@@ -1615,6 +1622,25 @@ class SqliteRepository:
             ).fetchall()
             return [dict(row) for row in rows]
 
+
+    def mark_invoices_sent(self, invoice_ids: list[int]) -> int:
+        """Marca as invoices como enviadas ao MySQL, atualizando sent_to_mysql_at.
+
+        Deve ser chamado após o PHP confirmar a importação bem-sucedida de um lote.
+        Retorna o número de linhas atualizadas.
+        """
+        if not invoice_ids:
+            return 0
+        now = iso_utc()
+        updated = 0
+        with self.transaction(immediate=True) as connection:
+            for invoice_id in invoice_ids:
+                cursor = connection.execute(
+                    "UPDATE invoice SET sent_to_mysql_at = ? WHERE id = ? AND sent_to_mysql_at IS NULL",
+                    (now, int(invoice_id)),
+                )
+                updated += cursor.rowcount
+        return updated
 
     def purge_outbox(self, retention_days: int) -> int:
         """Remove registros do integration_outbox mais antigos que retention_days."""
